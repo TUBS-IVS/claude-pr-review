@@ -47,8 +47,10 @@ spent, with one error line per problem. Locally: `python claude_review.py check-
 Releases are tags `vMAJOR.MINOR.PATCH`; the major tag `v1` points to the newest `v1.x.y`. Callers name
 `@v1`, so a fix reaches every calling repository at its next pull-request event without a change there. The
 workflow fetches the script at its own commit, so a caller always runs workflow and script of one version; it can pin
-an exact release (`@v1.0.0`) instead. A change that breaks the config keys, the caller's interface or the findings
-record is a new major version, which each repository adopts deliberately.
+an exact release (`@v1.0.0`) instead. A change that breaks the config keys, the caller's interface, the state block
+that later rounds of an open PR read, the findings record or the artifact names is a new major version, which each
+repository adopts deliberately; it never moves `v1`. Every run names the exact commit of the script it ran in its log
+and job summary ("Review tool"), so the version behind any review stays traceable.
 
 ### Release (maintainers)
 
