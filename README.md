@@ -31,7 +31,8 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
    [`tests/fixtures/caller/.github/claude-review.yml`](tests/fixtures/caller/.github/claude-review.yml) and set its
    paths for your repository. Keys: `labels` (`force`, `skip`), `skip_drafts`, `critical_paths`, `structure_paths`,
    `ignored_paths`, `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`), `tiers` (`light`, `full`,
-   `deep`, each with `model`, `max_turns`, `max_budget_usd` of at most 50 USD) and `review` (`prompt_file`,
+   `deep`, each with `model`, `max_turns`, `max_budget_usd` of at most 50 USD and an optional `effort`: `low`,
+   `medium`, `high`, `xhigh` or `max`; without it the model's default effort applies) and `review` (`prompt_file`,
    `allowed_tools` from Read, Grep, Glob). Make the caller, the config and the prompt critical paths.
 4. Add the prompt named by `review.prompt_file`. Placeholders: `{{REPO}}`, `{{PR}}`, `{{TIER}}`, `{{SHA}}`,
    `{{PR_TITLE}}`, `{{DIFF_BLOCK}}` and `{{ROUND_BLOCK}}` (both required), and `{{PR_BODY}}` between two `{{FENCE}}`
