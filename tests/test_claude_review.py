@@ -340,10 +340,15 @@ def test_the_fixture_prompt_and_tiers_give_a_bounded_read_only_run():
         assert 0 < float(value["--max-budget-usd"]) <= 50 and int(value["--max-turns"]) > 0
         # --bare: billed strictly to ANTHROPIC_API_KEY, never to a Claude plan login
         assert "--bare" in command
+        # no effort in the fixture config: the model's default applies, so no flag is sent
+        assert "--effort" not in command
         # the variadic tool list must come last, and the model must have no write or shell access
         assert command[-2] == "--allowedTools"
         assert set(command[-1].split(",")) <= {"Read", "Grep", "Glob"}
     assert CONFIG["rereview"]["verify_tier"] in CONFIG["tiers"] and int(CONFIG["rereview"]["max_rounds"]) >= 1
+    # A tier with an effort level sends it, still ahead of the variadic tool list.
+    command = cr.claude_command("claude", {**CONFIG["tiers"]["full"], "effort": "xhigh"}, review_cfg["allowed_tools"])
+    assert command[command.index("--effort") + 1] == "xhigh" and command[-2] == "--allowedTools"
 
 
 def test_the_pr_body_is_data_inside_the_prompt_and_fills_no_placeholder():
@@ -1121,6 +1126,8 @@ _PROMPT = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8"
     (lambda c: c["tiers"].pop("deep"), "'tiers.deep' is missing"),
     (lambda c: c["tiers"]["full"].update(modle="x"), "unknown key 'tiers.full.modle'"),
     (lambda c: c["tiers"]["light"].update(model=""), "'tiers.light.model' must be a model id"),
+    # the CLI only warns on an unknown effort level and runs at the default, so a typo must fail here
+    (lambda c: c["tiers"]["deep"].update(effort="ultra"), "'tiers.deep.effort' must be one of low, medium, high, xhigh, max"),
     (lambda c: c["review"]["allowed_tools"].append("Bash"), "not allowed: Bash"),
     (lambda c: c["review"].update(allowed_tools=[]), "'review.allowed_tools' must be a non-empty list"),
     (lambda c: c.update(critcal_paths=["x/**"]), "unknown key 'critcal_paths'"),

@@ -3,6 +3,14 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
+## v1.1.0 (2026-11-04)
+
+- New optional config key `tiers.<tier>.effort` (`low`, `medium`, `high`, `xhigh` or `max`): the review runs
+  `claude -p --effort <level>` for that tier. Without the key nothing changes: the CLI applies the model's default
+  (medium on Opus 5.5 and Sonnet 5.5, high on Fable 5.1; Claude Code docs, "Model configuration"). `check-config`
+  rejects any other value, because the CLI would only warn and silently run at the default. The review step's log
+  line names the effort of every run.
+
 ## v1.0.0 (2026-11-04)
 
 First release as a central repository (ADR-0176 in TUBS-IVS/eqasim-bs).

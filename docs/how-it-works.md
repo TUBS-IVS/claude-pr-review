@@ -162,7 +162,9 @@ the free `classify` job; suppressing them in the caller would copy the label nam
 ## The review run and the posting
 
 - `review` fills the placeholders of the prompt file (`review.prompt_file`) and runs `claude -p` with the tier's
-  `model`, `max_turns` and `max_budget_usd` (a hard cap per run), the JSON schema `FINDINGS_SCHEMA`, `--bare`
+  `model`, its `effort` when the config sets one (`--effort`; otherwise the model's default: medium on Opus 5.5 and
+  Sonnet 5.5, high on Fable 5.1, per the Claude Code docs "Model configuration"; the log line of the run names it),
+  `max_turns` and `max_budget_usd` (a hard cap per run), the JSON schema `FINDINGS_SCHEMA`, `--bare`
   (authentication strictly by `ANTHROPIC_API_KEY`, never a Claude plan login; no user hooks, plugins, memory or
   automatic CLAUDE.md loading; the prompt names the rule files to read), `--permission-mode dontAsk` and only the read
   tools of `review.allowed_tools` (Read, Grep, Glob). The model has no shell, cannot write files and cannot post

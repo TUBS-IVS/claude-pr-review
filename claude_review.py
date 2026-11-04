@@ -472,7 +472,12 @@ MAX_BUDGET_USD = 50.0
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
 THRESHOLD_KEYS = ("deep_min_structure_files", "deep_min_structure_lines", "deep_min_lines", "deep_min_files",
                   "full_min_lines", "full_min_files")
-TIER_KEYS = ("model", "max_turns", "max_budget_usd")
+#: `effort` is optional: without it the run uses the model's default effort (Claude Code docs,
+#: "Model configuration", "Adjust effort level": medium on Opus 5.5 / Sonnet 5.5, high on Fable).
+TIER_KEYS = ("model", "max_turns", "max_budget_usd", "effort")
+#: The levels `claude -p --effort` accepts; a level above what a model supports runs as the
+#: highest level that model has (the same docs page).
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 #: Every key the code reads, per section (None: a value, not a mapping). A misspelt key would
 #: otherwise be ignored and its rule would silently do nothing (e.g. no critical paths at all).
 CONFIG_KEYS = {"labels": ("force", "skip"), "skip_drafts": None, "critical_paths": None, "ignored_paths": None,
@@ -541,6 +546,10 @@ def config_problems(config, prompt_template) -> list:
         if not (isinstance(budget, (int, float)) and not isinstance(budget, bool) and 0 < budget <= MAX_BUDGET_USD):
             problems.append(f"'tiers.{name}.max_budget_usd' must be above 0 and at most {MAX_BUDGET_USD:g} USD "
                             f"(the per-run cap), got {budget!r}")
+        if "effort" in tier and tier["effort"] not in EFFORT_LEVELS:
+            # The CLI only warns on an unknown level and runs at the default, so a typo would silently
+            # undo the chosen effort; reject it here instead.
+            problems.append(f"'tiers.{name}.effort' must be one of {', '.join(EFFORT_LEVELS)}, got {tier['effort']!r}")
     rereview = _mapping(config, "rereview")
     if "max_rounds" in rereview and not (_whole(rereview["max_rounds"]) and rereview["max_rounds"] >= 1):
         problems.append(f"'rereview.max_rounds' must be a whole number >= 1, got {rereview['max_rounds']!r}")
@@ -698,12 +707,16 @@ def review_prompt(template: str, repo: str, pr: int, tier: str, sha: str, diff_s
 
 
 def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list) -> list:
+    # The tier's effort level, when the config sets one (check-config has validated it); without
+    # it the CLI applies the model's default.
+    effort = ["--effort", str(tier_cfg["effort"])] if tier_cfg.get("effort") else []
     return [
         claude_bin, "-p",
         # --bare: authenticate strictly with ANTHROPIC_API_KEY (never a Claude plan login, so the
         # run bills the API key), and load no user hooks, plugins, memory or CLAUDE.md on its own.
         "--bare",
         "--model", str(tier_cfg["model"]),
+        *effort,
         "--max-turns", str(int(tier_cfg["max_turns"])),
         "--max-budget-usd", str(float(tier_cfg["max_budget_usd"])),
         "--output-format", "json",
@@ -1357,7 +1370,8 @@ def _cmd_review(args) -> int:
         return 1
     command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"])
     print(f"[claude-review] running claude -p: tier {args.tier}, model {tier_cfg['model']}, "
-          f"max {tier_cfg['max_turns']} turns, budget {tier_cfg['max_budget_usd']} USD")
+          f"effort {tier_cfg.get('effort') or 'model default'}, max {tier_cfg['max_turns']} turns, "
+          f"budget {tier_cfg['max_budget_usd']} USD")
     # The prompt goes in on stdin: no argv length limit, and it is not echoed in process listings.
     completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8")
     Path(args.out).write_text(completed.stdout, encoding="utf-8")
