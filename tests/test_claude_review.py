@@ -242,6 +242,23 @@ def test_match_comment_ids_pairs_posted_comments_with_planned_ones():
     assert cr.match_comment_ids(planned, posted) == [11, 22, None]
 
 
+def test_match_comment_ids_works_on_the_real_review_comments_listing():
+    # GitHub's GET pulls/<pr>/reviews/<id>/comments returns position and original_position but no
+    # line field (checked on PR #521 and #536): a key with the line matched none of 50 posted
+    # comments, so every findings record carried comment_id None and no thread could be read.
+    # Identical bodies in one file pair up in posting order.
+    planned = [{"path": "a.py", "line": 3, "body": "**HIGH: x**\n\nb"},
+               {"path": "a.py", "line": 40, "body": "**LOW: y**\n\nc"},
+               {"path": "b.py", "line": 9, "body": "**LOW: z**\n\nd"},
+               {"path": "c.py", "line": 5, "body": "**LOW: same**\n\ne"},
+               {"path": "c.py", "line": 8, "body": "**LOW: same**\n\ne"}]
+    posted = [{"id": 11, "path": "a.py", "position": 1, "original_position": 320, "body": "**HIGH: x**\n\nb"},
+              {"id": 22, "path": "a.py", "position": 1, "original_position": 124, "body": "**LOW: y**\n\nc"},
+              {"id": 31, "path": "c.py", "position": 2, "original_position": 5, "body": "**LOW: same**\n\ne"},
+              {"id": 32, "path": "c.py", "position": 4, "original_position": 8, "body": "**LOW: same**\n\ne"}]
+    assert cr.match_comment_ids(planned, posted) == [11, 22, None, 31, 32]
+
+
 def test_post_refuses_a_failed_run(tmp_path, capsys):
     result = tmp_path / "result.json"
     result.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": True,

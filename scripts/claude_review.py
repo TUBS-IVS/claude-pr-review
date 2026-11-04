@@ -736,14 +736,20 @@ def verification_reply(sha: str, note: str) -> str:
 
 
 def match_comment_ids(inline: list, posted: list) -> list:
-    """Return the GitHub id of each planned inline comment (None where no posted comment matches)."""
+    """Return the GitHub id of each planned inline comment (None where no posted comment matches).
+
+    The key is (path, body) without the line: the listing of one review's comments
+    (``pulls/<pr>/reviews/<id>/comments``) returns ``position`` but no ``line`` field, so a key
+    with the line matched no posted comment at all (every findings record carried comment_id None
+    until 2026-11-04). Comments with the same path and body pair up in posting order, which is
+    the order GitHub lists them in."""
     by_key: dict = {}
     for comment in posted:
-        key = (comment.get("path"), comment.get("line"), (comment.get("body") or "").strip())
+        key = (comment.get("path"), (comment.get("body") or "").strip())
         by_key.setdefault(key, []).append(comment.get("id"))
     ids = []
     for comment in inline:
-        candidates = by_key.get((comment["path"], comment["line"], comment["body"].strip()), [])
+        candidates = by_key.get((comment["path"], comment["body"].strip()), [])
         ids.append(candidates.pop(0) if candidates else None)
     return ids
 
