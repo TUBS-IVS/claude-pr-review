@@ -1,0 +1,138 @@
+# Gate for the automatic Claude PR review (.github/workflows/claude-review.yml).
+#
+# scripts/claude_review.py classify reads this file and the PR diff and decides,
+# without calling any model, whether the review runs and at which tier. Every
+# decision is written with its reason to the job summary, so a skipped review is
+# never silent. See docs/codebase/notes/claude-pr-review.md.
+#
+# ASSUMPTION: all thresholds below are starting values, not measured; each block names
+# the date its values were chosen. Re-tune them from the per-run cost records in the job
+# summaries.
+
+labels:
+  force: claude-review        # adding it starts ONE deep-tier review; later pushes are gated normally
+  skip: skip-claude-review    # never review while set
+
+# Draft PRs are reviewed only when the force label is added.
+skip_drafts: true
+
+# Paths whose changes can alter model behaviour, scientific output, the
+# verification gate, this review gate itself, or the rules every agent session
+# follows (CLAUDE.md and .claude/rules/ hold the push rule and the test gate).
+# Glob syntax: "**" matches across directories, "*" and "?" stay within one path
+# segment (not fnmatch semantics).
+critical_paths:
+  - "CLAUDE.md"
+  - ".claude/rules/**"
+  - "braunschweig/**"
+  - "synthesis/**"
+  - "matsim/**"
+  - "data/**"
+  - "eqasim_common/**"
+  - "configs/**"
+  - "scripts/run_tests.py"
+  - "scripts/run_synpp.py"
+  - ".github/workflows/**"
+  - ".github/claude-review.yml"
+  - ".github/claude-review-prompt.md"
+  - "scripts/claude_review.py"
+
+# Paths that never count towards the changed-line totals or the file count
+# (generated or machine-written; reviewing them costs tokens and finds nothing).
+ignored_paths:
+  - "docs/generated/**"
+  - "environments/**"
+  - "**/*.lock"
+  - "tests/baselines/**"
+
+# Paths that hold the backbone of the repository: the agent rules, the base config and its
+# overlays, the pipeline machinery (synpp fork, tokens, determinism, config composition,
+# provenance), the simulation setup, the shared eqasim code, the documentation gate, the test
+# and run entry points, the workflows and this review gate. A change that restructures them gets
+# the deep tier (see `thresholds`). Every structure path also counts as critical. Same glob
+# syntax as critical_paths. ASSUMPTION: the list was chosen on 2026-11-02 from the layout of the
+# repository; extend it when a new part becomes load-bearing.
+structure_paths:
+  - "CLAUDE.md"
+  - ".claude/rules/**"
+  - "configs/base_bs.yml"
+  - "configs/overlays/**"
+  - "braunschweig/synpp_fork/**"
+  - "braunschweig/synpp_deterministic.py"
+  - "braunschweig/synpp_tokens.py"
+  - "braunschweig/config_compose.py"
+  - "braunschweig/provenance.py"
+  - "braunschweig/parallelism.py"
+  - "braunschweig/cache_share.py"
+  - "braunschweig/constants.py"
+  - "braunschweig/documentation/**"
+  - "braunschweig/matsim/**"
+  - "matsim/**"
+  - "synthesis/**"
+  - "eqasim_common/**"
+  - "scripts/run_tests.py"
+  - "scripts/run_synpp.py"
+  - ".github/workflows/**"
+  - ".github/claude-review.yml"
+  - ".github/claude-review-prompt.md"
+  - "scripts/claude_review.py"
+
+# Branch kinds (prefix before "/") that skip the review unless a critical path is touched.
+skip_kinds:
+  - docs
+
+# Three tiers (scripts/claude_review.py classify, first match wins):
+#   deep  - a structure file added, deleted or renamed; or >= deep_min_structure_files structure
+#           files or >= deep_min_structure_lines changed lines in structure files; or a large
+#           change anywhere (>= deep_min_lines lines or >= deep_min_files files)
+#   full  - a critical path touched, or >= full_min_lines lines, or >= full_min_files files
+#   light - every other change with at least one counted line or file
+# ASSUMPTION: starting values chosen on 2026-11-02 (the full thresholds are the former light
+# ones), re-tune them from the cost records.
+thresholds:
+  deep_min_structure_files: 5   # changed structure files for the deep tier
+  deep_min_structure_lines: 300 # changed lines in structure files for the deep tier
+  deep_min_lines: 1000          # changed lines anywhere for the deep tier
+  deep_min_files: 25            # changed files anywhere for the deep tier
+  full_min_lines: 150           # changed lines for the full tier
+  full_min_files: 8             # changed files for the full tier
+
+# Further rounds on the same PR (after a push to a PR the review has already seen). The gate
+# then measures only the files whose change against main differs from the last complete round
+# (scripts/claude_review.py interdiff), with the thresholds above; a file added, deleted or
+# renamed since the last complete round counts as a structure change. A push the rules above
+# would not review (a docs/ branch without a critical path) still gets verify_tier while
+# findings of earlier rounds are open, so a fix is checked; a push of ignored files alone gets
+# no run, like a merge of the base branch: it cannot fix a finding. After max_rounds automatic
+# rounds the review stops; adding the force label reads the whole PR again and does not count.
+# ASSUMPTION: starting values chosen on 2026-10-28, re-tune from the cost records.
+rereview:
+  max_rounds: 3
+  verify_tier: light
+
+# max_budget_usd is a hard per-run cap (claude -p --max-budget-usd): 10 / 50 / 50 USD, the
+# owner's choice (2026-10-30 for light and full, 2026-11-02 for deep); the turn limits are an
+# ASSUMPTION (the budget is the binding limit), re-tune them from the cost records.
+tiers:
+  light:
+    model: claude-sonnet-5-5
+    max_turns: 25
+    max_budget_usd: 10.0
+  full:
+    model: claude-opus-5-5
+    max_turns: 250
+    max_budget_usd: 50.0
+  deep:
+    model: claude-fable-5-1
+    max_turns: 250
+    max_budget_usd: 50.0
+
+# The review run (scripts/claude_review.py review). The model only reads; posting is done
+# by the script, which also writes the PR diff to a file the model reads (no shell tools).
+# Placeholders in the prompt file: {{REPO}}, {{PR}}, {{TIER}}, {{SHA}}, {{DIFF_FILE}}.
+review:
+  prompt_file: .github/claude-review-prompt.md
+  allowed_tools:
+    - Read
+    - Grep
+    - Glob

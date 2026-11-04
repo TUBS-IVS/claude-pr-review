@@ -1,0 +1,200 @@
+name: Claude PR review
+
+# Advisory code review by Claude on pull requests to main. A model-free gate job
+# (the classify command of the review script, thresholds in .github/claude-review.yml) decides
+# whether a review runs and at which tier; only then is the API called. Each review
+# records its API cost in the job summary and as an artifact. The review posts comments
+# only; it is not a required check. See docs/codebase/notes/claude-pr-review.md.
+#
+# The review runs in rounds: the state and interdiff commands read the earlier rounds from
+# the bot's summary comment and compare the PR at the last reviewed commit and at head, so a
+# further round reviews only what changed, verifies the open findings and stops after the
+# configured number of automatic rounds. The why is in the note and ADR-0171.
+#
+# Prerequisite: repository secret ANTHROPIC_API_KEY (a workspace key). The review runs
+# `claude -p` read-only; the script posts its findings with GITHUB_TOKEN (github-actions[bot]).
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    # The generated views are rebuilt by bot PRs that merge within seconds (ADR-0168); the gate
+    # ignores these files anyway, so a run for them would only fail or queue for nothing.
+    paths-ignore:
+      - "docs/generated/**"
+
+# One queue per PR and event kind. A running review is never cancelled (its cost is already
+# spent and recorded only at the end); a newer push replaces a still-pending push run. Every
+# label event gets a group of its own label, so a triage label can neither cancel nor displace
+# a review, and a pending forced review (the force label) is not displaced by a later
+# push (Claude review finding on PR #497).
+concurrency:
+  group: >-
+    claude-review-${{ github.event.pull_request.number }}-${{
+    github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+      tier: ${{ steps.gate.outputs.tier }}
+      model: ${{ steps.gate.outputs.model }}
+      max_turns: ${{ steps.gate.outputs.max_turns }}
+      mode: ${{ steps.gate.outputs.mode }}
+      diff_source: ${{ steps.gate.outputs.diff_source }}
+      round: ${{ steps.gate.outputs.round }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install gate dependencies
+        run: pip install pyyaml
+
+      - name: Decide whether and how to review (no model call)
+        id: gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Fork and Dependabot PRs get no Actions secrets; say so instead of failing later.
+          if [ "$SAME_REPO" != "true" ] || [ "$ACTOR" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "### Claude review gate" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Skipped: fork or Dependabot PR, no API secret available." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # quotepath=false: non-ASCII paths stay literal, so they still match the globs.
+          git -c core.quotepath=false diff --numstat "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/numstat.tsv"
+          # Added, deleted and renamed files: a structure change of the structure paths gets the deep tier.
+          git -c core.quotepath=false diff --name-status -M "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/name-status.tsv"
+          # The review history of the PR and the file-level interdiff since the last reviewed commit.
+          python scripts/claude_review.py state --repo "$REPO" --pr "$PR_NUMBER" --out "$RUNNER_TEMP/state.json"
+          python scripts/claude_review.py interdiff --config .github/claude-review.yml \
+            --state "$RUNNER_TEMP/state.json" --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --out-dir "$RUNNER_TEMP/interdiff"
+          draft_flag=""
+          if [ "$IS_DRAFT" = "true" ]; then draft_flag="--draft"; fi
+          python scripts/claude_review.py classify \
+            --config .github/claude-review.yml \
+            --numstat "$RUNNER_TEMP/numstat.tsv" --name-status "$RUNNER_TEMP/name-status.tsv" \
+            --branch "$HEAD_REF" --labels "$LABELS" $draft_flag \
+            --event-action "$EVENT_ACTION" --event-label "$EVENT_LABEL" \
+            --state "$RUNNER_TEMP/state.json" \
+            --interdiff-json "$RUNNER_TEMP/interdiff/interdiff.json" \
+            --interdiff-numstat "$RUNNER_TEMP/interdiff/interdiff.numstat"
+
+  review:
+    needs: classify
+    if: needs.classify.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    # Runs of up to 19 minutes were seen; a job cut off by the timeout loses its cost record.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      # Claude Code CLI, pinned for reproducible review behaviour. 2.1.309 is the version
+      # claude-code-action v1.0.259 installed and that reached the API with Opus 5.5.
+      CLAUDE_CODE_VERSION: "2.1.309"
+      TIER: ${{ needs.classify.outputs.tier }}
+      MODEL: ${{ needs.classify.outputs.model }}
+      MODE: ${{ needs.classify.outputs.mode }}
+      DIFF_SOURCE: ${{ needs.classify.outputs.diff_source }}
+      ROUND: ${{ needs.classify.outputs.round }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the script diffs base...head with local git, as the gate does.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install review dependencies
+        run: |
+          pip install pyyaml
+          npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+
+      # State and interdiff are recomputed here: no artifacts travel between the jobs.
+      - name: Read the review history and compute the interdiff (no model call)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/claude_review.py state --repo "$REPO" --pr "$PR_NUMBER" --out "$RUNNER_TEMP/state.json"
+          python scripts/claude_review.py interdiff --config .github/claude-review.yml \
+            --state "$RUNNER_TEMP/state.json" --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --out-dir "$RUNNER_TEMP/interdiff"
+      # Why claude -p and not anthropics/claude-code-action: docs/codebase/notes/claude-pr-review.md.
+      - name: Claude review (read-only, structured findings)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/claude_review.py review --config .github/claude-review.yml \
+            --tier "$TIER" --repo "$REPO" --pr "$PR_NUMBER" --sha "$HEAD_SHA" --base-sha "$BASE_SHA" \
+            --state "$RUNNER_TEMP/state.json" --interdiff-dir "$RUNNER_TEMP/interdiff" \
+            --diff-source "$DIFF_SOURCE" --mode "$MODE" --round "$ROUND" \
+            --out "$RUNNER_TEMP/claude-review-result.json"
+      - name: Record review cost
+        if: always()
+        run: |
+          python scripts/claude_review.py cost --execution-file "$RUNNER_TEMP/claude-review-result.json" \
+            --tier "$TIER" --model "$MODEL" --json claude-review-cost.json
+      # Also after a failed review step: a run that cost money is then recorded as an incomplete round,
+      # so it counts against the round cap; without a result the step only says so.
+      - name: Post review comments
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/claude_review.py post --result "$RUNNER_TEMP/claude-review-result.json" \
+            --repo "$REPO" --pr "$PR_NUMBER" --tier "$TIER" --sha "$HEAD_SHA" \
+            --diff-file .claude/review-pr.diff --config .github/claude-review.yml \
+            --state "$RUNNER_TEMP/state.json" --interdiff-dir "$RUNNER_TEMP/interdiff" \
+            --mode "$MODE" --round "$ROUND" \
+            --record "$RUNNER_TEMP/claude-review-findings.json"
+      - name: Upload cost record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-cost-pr${{ github.event.pull_request.number }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          path: claude-review-cost.json
+          if-no-files-found: warn
+          retention-days: 90
+      # The session retro (~/.claude/retro, retro_reviews.py) downloads this record to learn
+      # from confirmed findings; see docs/codebase/notes/claude-pr-review.md.
+      - name: Upload findings record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-findings-pr${{ github.event.pull_request.number }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/claude-review-findings.json
+          if-no-files-found: warn
+          retention-days: 90
