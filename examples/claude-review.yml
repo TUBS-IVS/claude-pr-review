@@ -1,0 +1,40 @@
+name: Claude PR review
+
+# Advisory code review by Claude on pull requests, run by the central reusable workflow of
+# TUBS-IVS/claude-pr-review (README.md and docs/how-it-works.md there). This file holds only what
+# belongs to this repository: the triggers, the queueing (concurrency) and the token permissions.
+# The gate config .github/claude-review.yml and the prompt .github/claude-review-prompt.md are this
+# repository's own. Keep this file's name: the maintainer's session retro lists review runs by it.
+#
+# Prerequisite: repository secret ANTHROPIC_API_KEY (a key of a workspace of the Console
+# organization). Only this secret is handed to the central workflow.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+# One queue per PR and event kind. A running review is never cancelled (its cost is already
+# spent and recorded only at the end); a newer push replaces a still-pending push run. Every
+# label event gets a group of its own label, so a triage label can neither cancel nor displace
+# a review, and a pending forced review (the force label) is not displaced by a later push.
+# It stays here, not in the called workflow: a group shared by both would deadlock.
+concurrency:
+  group: >-
+    claude-review-${{ github.event.pull_request.number }}-${{
+    github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  pr-review:
+    # The most the review needs; the called workflow narrows it per job (the gate job only reads).
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: TUBS-IVS/claude-pr-review/.github/workflows/review.yml@v1
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

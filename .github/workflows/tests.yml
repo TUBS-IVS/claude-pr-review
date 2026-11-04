@@ -1,0 +1,32 @@
+name: Tests
+
+# The tests of claude_review.py and of both workflows (tests/test_claude_review.py). Python 3.10 is the
+# version the review workflow runs the script with; Windows too, because the script and its tests are also
+# run locally there (line endings and path separators have bitten before).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install test dependencies
+        run: pip install pytest pyyaml
+      - name: Run the tests
+        run: python -m pytest -q tests

@@ -1,15 +1,25 @@
 """Gate, review run, posting and cost record of the automatic Claude PR review
-(.github/workflows/claude-review.yml).
+(the reusable workflow .github/workflows/review.yml of TUBS-IVS/claude-pr-review).
 
-    python scripts/claude_review.py classify --config .github/claude-review.yml --numstat diff.tsv \
+    python claude_review.py check-config --config .github/claude-review.yml
+    python claude_review.py classify --config .github/claude-review.yml --numstat diff.tsv \
         [--name-status status.tsv] --branch feature/i1-x [--labels a,b] [--draft] \
         [--event-action labeled --event-label x]
-    python scripts/claude_review.py review --config .github/claude-review.yml --tier full \
+    python claude_review.py review --config .github/claude-review.yml --tier full \
         --repo OWNER/NAME --pr 12 --sha <head sha> --out result.json [--diff-out .claude/review-pr.diff] \
         [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N]
-    python scripts/claude_review.py post --result result.json --repo OWNER/NAME --pr 12 \
+    python claude_review.py post --result result.json --repo OWNER/NAME --pr 12 \
         --tier full --sha <head sha> [--diff-file pr.diff] [--dry-run]
-    python scripts/claude_review.py cost --execution-file result.json [--tier full] [--model m] [--json out.json]
+    python claude_review.py cost --execution-file result.json [--tier full] [--model m] [--json out.json]
+
+All commands run from the root of the reviewed repository's checkout: the config path, the prompt
+file it names and the diff file are relative to it.
+
+check-config validates the calling repository's gate config and prompt WITHOUT calling a model,
+before the gate decides anything: every tier the gate can pick exists with a model, a turn limit
+and a budget within the per-run cap, the model gets read-only tools only, no key is misspelt and
+the prompt fills without an unknown placeholder. Each problem is one ::error:: line; any problem
+fails the command, so a broken or unbounded config stops the gate instead of the review.
 
 classify decides WITHOUT calling a model whether the review runs and at which tier
 ("light", "full" or "deep"), from the `git diff --numstat` and `--name-status` of the PR (how
@@ -34,7 +44,10 @@ cost reads the result record (the `claude -p` JSON result, or an Agent SDK messa
 reports the API cost in USD, the token counts, turns and duration as the CLI recorded them.
 A missing or unparsable record is an error (exit 1), not a silent zero.
 
-See docs/codebase/notes/claude-pr-review.md.
+See docs/how-it-works.md. This script began in TUBS-IVS/eqasim-bs (scripts/claude_review.py,
+imported here from its main at 5d08a5f7, then fixed: the first commits of this repository); PR,
+issue and ADR numbers in the comments below refer to that repository, whose git history holds the
+script's history before v1.0.0.
 """
 from __future__ import annotations
 
@@ -447,6 +460,118 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
         return decide(verify, f"verify: {context.open_findings} open finding(s), the push itself is not reviewed ({why})",
                       "verify", "interdiff")
     return decide(tier, why, "rereview", "interdiff")
+
+
+# What check-config holds a calling repository's gate config to. Each repository keeps its own config
+# and prompt; these checks are the part every one of them must meet (ADR-0176 in TUBS-IVS/eqasim-bs).
+#: The tiers classify can pick; a config must define each of them, or a run ends in a KeyError.
+TIER_NAMES = ("light", "full", "deep")
+#: The owner's hard cap per review run in USD (ADR-0175 in TUBS-IVS/eqasim-bs): no tier may allow more.
+MAX_BUDGET_USD = 50.0
+#: The model only reads; posting is done by `post`, never by the model, and it gets no shell.
+READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
+THRESHOLD_KEYS = ("deep_min_structure_files", "deep_min_structure_lines", "deep_min_lines", "deep_min_files",
+                  "full_min_lines", "full_min_files")
+TIER_KEYS = ("model", "max_turns", "max_budget_usd")
+#: Every key the code reads, per section (None: a value, not a mapping). A misspelt key would
+#: otherwise be ignored and its rule would silently do nothing (e.g. no critical paths at all).
+CONFIG_KEYS = {"labels": ("force", "skip"), "skip_drafts": None, "critical_paths": None, "ignored_paths": None,
+               "structure_paths": None, "skip_kinds": None, "thresholds": THRESHOLD_KEYS,
+               "rereview": ("max_rounds", "verify_tier"), "tiers": TIER_NAMES,
+               "review": ("prompt_file", "allowed_tools")}
+#: Placeholders a prompt must contain: where the diff is, and the open findings of earlier rounds.
+REQUIRED_PLACEHOLDERS = ("DIFF_BLOCK", "ROUND_BLOCK")
+
+
+def _whole(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _mapping(config: dict, key: str) -> dict:
+    value = config.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def config_problems(config, prompt_template) -> list:
+    """Every reason why a gate config and its prompt would make a broken or unbounded review run;
+    [] when there is none. ``prompt_template`` is the text of ``review.prompt_file``, or None when
+    that file cannot be read."""
+    if not isinstance(config, dict):
+        return ["the config is not a mapping of keys"]
+    problems = [f"unknown key '{key}' (known: {', '.join(CONFIG_KEYS)})" for key in sorted(set(config) - set(CONFIG_KEYS))]
+    for section, keys in CONFIG_KEYS.items():
+        if keys is None:
+            continue
+        if not isinstance(config.get(section), dict):
+            problems.append(f"'{section}' is missing or not a mapping")
+            continue
+        problems += [f"unknown key '{section}.{key}' (known: {', '.join(keys)})"
+                     for key in sorted(set(config[section]) - set(keys))]
+        problems += [f"'{section}.{key}' is missing" for key in keys if key not in config[section]]
+    for key in ("critical_paths", "ignored_paths", "structure_paths", "skip_kinds"):
+        value = config.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            problems.append(f"'{key}' must be a list of non-empty strings")
+    if not isinstance(config.get("skip_drafts", True), bool):
+        problems.append("'skip_drafts' must be true or false")
+    labels = _mapping(config, "labels")
+    for key in ("force", "skip"):
+        if key in labels and not (isinstance(labels[key], str) and labels[key].strip()):
+            problems.append(f"'labels.{key}' must be a label name")
+    if labels.get("force") and labels.get("force") == labels.get("skip"):
+        problems.append("'labels.force' and 'labels.skip' must be different labels")
+    thresholds = _mapping(config, "thresholds")
+    problems += [f"'thresholds.{key}' must be a whole number >= 0, got {thresholds[key]!r}"
+                 for key in THRESHOLD_KEYS if key in thresholds and not (_whole(thresholds[key]) and thresholds[key] >= 0)]
+    tiers = _mapping(config, "tiers")
+    for name in TIER_NAMES:
+        if name not in tiers:
+            continue  # reported as missing above
+        tier = tiers[name]
+        if not isinstance(tier, dict):
+            problems.append(f"'tiers.{name}' must be a mapping of {', '.join(TIER_KEYS)}")
+            continue
+        problems += [f"unknown key 'tiers.{name}.{key}' (known: {', '.join(TIER_KEYS)})"
+                     for key in sorted(set(tier) - set(TIER_KEYS))]
+        if not (isinstance(tier.get("model"), str) and tier["model"].strip()):
+            problems.append(f"'tiers.{name}.model' must be a model id")
+        if not (_whole(tier.get("max_turns")) and tier["max_turns"] >= 1):
+            problems.append(f"'tiers.{name}.max_turns' must be a whole number >= 1, got {tier.get('max_turns')!r}")
+        budget = tier.get("max_budget_usd")
+        if not (isinstance(budget, (int, float)) and not isinstance(budget, bool) and 0 < budget <= MAX_BUDGET_USD):
+            problems.append(f"'tiers.{name}.max_budget_usd' must be above 0 and at most {MAX_BUDGET_USD:g} USD "
+                            f"(the per-run cap), got {budget!r}")
+    rereview = _mapping(config, "rereview")
+    if "max_rounds" in rereview and not (_whole(rereview["max_rounds"]) and rereview["max_rounds"] >= 1):
+        problems.append(f"'rereview.max_rounds' must be a whole number >= 1, got {rereview['max_rounds']!r}")
+    if "verify_tier" in rereview and rereview["verify_tier"] not in TIER_NAMES:
+        problems.append(f"'rereview.verify_tier' must be one of {', '.join(TIER_NAMES)}, got {rereview['verify_tier']!r}")
+    review = _mapping(config, "review")
+    if "allowed_tools" in review:
+        tools = review["allowed_tools"]
+        if not (isinstance(tools, list) and tools and all(isinstance(tool, str) for tool in tools)):
+            problems.append("'review.allowed_tools' must be a non-empty list of tool names")
+        elif set(tools) - set(READ_ONLY_TOOLS):
+            problems.append(f"'review.allowed_tools' may only hold {', '.join(READ_ONLY_TOOLS)} (the model only reads); "
+                            f"not allowed: {', '.join(sorted(set(tools) - set(READ_ONLY_TOOLS)))}")
+    if "prompt_file" in review:
+        if prompt_template is None:
+            problems.append(f"'review.prompt_file' {review['prompt_file']!r} cannot be read")
+        else:
+            prompt_file = review["prompt_file"]
+            missing = ["{{" + key + "}}" for key in REQUIRED_PLACEHOLDERS if "{{" + key + "}}" not in prompt_template]
+            if missing:
+                problems.append(f"the prompt {prompt_file} lacks " + ", ".join(missing))
+            if "{{PR_BODY}}" in prompt_template and prompt_template.count("{{FENCE}}") < 2:
+                problems.append(f"the prompt {prompt_file} must put " + "{{PR_BODY}} between two {{FENCE}} lines, "
+                                "so the author's text stays data")
+            try:
+                # The same call as a real run, with stand-in values: an unknown placeholder raises here.
+                review_prompt(prompt_template, "owner/name", 1, "light", "0" * 40, "pr", ".claude/review-pr.diff.numbered",
+                              {"changed": [], "reverted": []}, empty_state(), "first", 1, "title", "body")
+            except ValueError as error:
+                problems.append(f"the prompt {prompt_file}: {error}")
+    return problems
 
 
 def read_result_record(execution_file: Path) -> dict:
@@ -996,6 +1121,33 @@ def _append(env_var: str, text: str) -> None:
             handle.write(text)
 
 
+def _cmd_check_config(args) -> int:
+    """Validate the calling repository's gate config and prompt; no model, no cost."""
+    import yaml
+
+    try:
+        config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        problems, prompt_file = [f"cannot read the config: {' '.join(str(error).split())}"], ""
+    else:
+        prompt_file = str(_mapping(config, "review").get("prompt_file", "")) if isinstance(config, dict) else ""
+        try:
+            template = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else None
+        except OSError:
+            template = None
+        problems = config_problems(config, template)
+    for problem in problems:
+        print(f"::error::[claude-review] {args.config}: {problem}")
+    if problems:
+        _append("GITHUB_STEP_SUMMARY", f"### Claude review config\n\n- `{args.config}` fails {len(problems)} check(s); "
+                                       "no review runs until it is fixed:\n"
+                                       + "".join(f"  - {problem}\n" for problem in problems))
+        return 1
+    print(f"[claude-review] config {args.config} and prompt {prompt_file}: OK (tiers {', '.join(TIER_NAMES)}, "
+          f"budget <= {MAX_BUDGET_USD:g} USD per run, tools {', '.join(config['review']['allowed_tools'])})")
+    return 0
+
+
 def _cmd_classify(args) -> int:
     import yaml  # only classify needs it; the cost step runs on a bare runner Python
 
@@ -1425,6 +1577,10 @@ def upsert_summary(repo: str, pr: int, bot_login: str, body: str, stale: bool = 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_check = sub.add_parser("check-config", help="validate the gate config and the prompt it names (no model call)")
+    p_check.add_argument("--config", required=True, help="the calling repository's gate config")
+    p_check.set_defaults(func=_cmd_check_config)
 
     p_classify = sub.add_parser("classify", help="decide whether and how the review runs")
     p_classify.add_argument("--config", required=True)
