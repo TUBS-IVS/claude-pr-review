@@ -1,4 +1,4 @@
-"""Gate, review run, posting and cost record of the automatic Claude PR review
+"""Gate, review run, posting and run record of the automatic Claude PR review
 (the reusable workflow .github/workflows/review.yml of TUBS-IVS/claude-pr-review).
 
     python claude_review.py check-config --config .github/claude-review.yml
@@ -10,7 +10,7 @@
         [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N]
     python claude_review.py post --result result.json --repo OWNER/NAME --pr 12 \
         --tier full --sha <head sha> [--diff-file pr.diff] [--dry-run]
-    python claude_review.py cost --execution-file result.json [--tier full] [--model m] [--json out.json]
+    python claude_review.py outcome --execution-file result.json [--tier full] [--model m] [--json out.json]
 
 All commands run from the root of the reviewed repository's checkout: the config path, the prompt
 file it names and the diff file are relative to it.
@@ -40,9 +40,14 @@ one summary comment per PR up to date (edited in place). A finding whose line is
 the diff cannot be an inline comment; it is listed in the summary instead, and the
 inline/summary-only counts are logged. --dry-run prints the payloads and posts nothing.
 
-cost reads the result record (the `claude -p` JSON result, or an Agent SDK message list) and
-reports the API cost in USD, the token counts, turns and duration as the CLI recorded them.
-A missing or unparsable record is an error (exit 1), not a silent zero.
+outcome reads the result record (the `claude -p` JSON result, or an Agent SDK message list) and
+reports how the run ended: its status, turns and duration as the CLI recorded them. A missing or
+unparsable record is an error (exit 1), not a silent zero.
+
+No output of a run shows its API cost or its token counts (which give the cost at the public
+prices): the comments with their state block, the log, the job summary and the artifacts are all
+public for a public repository, and the cost is not published (the owner's decision of
+2026-11-05). A run reads the cost of its own result only to tell whether the round called the model.
 
 See docs/how-it-works.md. This script began in TUBS-IVS/eqasim-bs (scripts/claude_review.py,
 imported here from its main at 5d08a5f7, then fixed: the first commits of this repository); PR,
@@ -55,6 +60,7 @@ import argparse
 import copy
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -79,7 +85,7 @@ REJECTED_PREFIXES = ("rejected", "not changed")
 FIXED_PREFIXES = ("fixed",)
 # Verify rounds a PR still gets after `rereview.max_rounds`, only for fixes of open findings (the owner's
 # decision of 2026-11-05: a fix pushed after the last round is still checked). ASSUMPTION: 2 bounds the
-# cost (a light-tier verify round cost 0.15 USD on 2026-11-05); a caller sets `rereview.verify_after_cap`.
+# extra runs; a caller sets `rereview.verify_after_cap`.
 VERIFY_AFTER_CAP = 2
 # Our own verification replies; they must never be taken for the author's answer.
 BOT_REPLY_PREFIX = "re-review at"
@@ -146,9 +152,22 @@ def _state_span(body: str):
     return None if end < 0 else (start, end + len(STATE_END))
 
 
+def _drop_round_cost(round_):
+    """A round as it is kept from v1.3.0 on. A state block written before carries each round's API
+    cost (``cost_usd``); only whether the round called the model (a cost above zero) is kept, as
+    ``model_call``, so the round cap of an open PR still holds, and the amount is dropped, so the
+    next write of the comment no longer shows it."""
+    if isinstance(round_, dict) and "cost_usd" in round_:
+        round_ = dict(round_)
+        cost = round_.pop("cost_usd")
+        round_.setdefault("model_call", float(cost or 0) > 0)
+    return round_
+
+
 def decode_state(body: str) -> dict | None:
     """The state of a summary comment, or None for no block or a block that is not valid state
-    (hand-edited): the caller logs the fallback instead of crashing the gate."""
+    (hand-edited): the caller logs the fallback instead of crashing the gate. Rounds written before
+    v1.3.0 come back without their cost (``_drop_round_cost``)."""
     span = _state_span(body)
     if span is None:
         return None
@@ -159,6 +178,10 @@ def decode_state(body: str) -> dict | None:
     if (not isinstance(state, dict) or not isinstance(state.get("rounds"), list)
             or not isinstance(state.get("findings"), list)):
         return None
+    try:
+        state["rounds"] = [_drop_round_cost(round_) for round_ in state["rounds"]]
+    except (TypeError, ValueError):
+        return None  # a cost that is no number: hand-edited
     return state
 
 
@@ -180,11 +203,11 @@ def last_complete_sha(state: dict) -> str:
 
 def automatic_rounds(state: dict) -> int:
     """Rounds that count against rereview.max_rounds: every automatic round that called the model
-    (cost above zero), complete or not. A forced round and a round without a model call do not use
-    one up. ``complete`` only decides whether the reviewed commit moves (last_complete_sha):
-    counting complete rounds only would let a PR the model never reads in full be reviewed on
-    every push without limit (Claude review finding on PR #521)."""
-    return sum(1 for r in state["rounds"] if r.get("automatic") and float(r.get("cost_usd") or 0) > 0)
+    (``model_call``: the API reported a cost above zero), complete or not. A forced round and a round
+    without a model call do not use one up. ``complete`` only decides whether the reviewed commit
+    moves (last_complete_sha): counting complete rounds only would let a PR the model never reads in
+    full be reviewed on every push without limit (Claude review finding on PR #521)."""
+    return sum(1 for r in state["rounds"] if r.get("automatic") and r.get("model_call"))
 
 
 def open_findings(state: dict) -> list:
@@ -491,8 +514,11 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
 # and prompt; these checks are the part every one of them must meet (ADR-0176 in TUBS-IVS/eqasim-bs).
 #: The tiers classify can pick; a config must define each of them, or a run ends in a KeyError.
 TIER_NAMES = ("light", "full", "deep")
-#: The owner's hard cap per review run in USD (ADR-0175 in TUBS-IVS/eqasim-bs): no tier may allow more.
-MAX_BUDGET_USD = 50.0
+#: The secret, passed by the caller, that holds each tier's hard budget per run in USD as JSON
+#: ({"light": <usd>, "full": <usd>, "deep": <usd>}). The budgets are the owner's and are not published
+#: (the owner's decision of 2026-11-05), so they live in an organization secret, not in the public
+#: config. Without the secret the config's deprecated `max_budget_usd` still bounds the run, with a warning.
+BUDGETS_ENV = "CLAUDE_REVIEW_BUDGETS"
 #: The model only reads; posting is done by `post`, never by the model, and it gets no shell.
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
 THRESHOLD_KEYS = ("deep_min_structure_files", "deep_min_structure_lines", "deep_min_lines", "deep_min_files",
@@ -519,18 +545,66 @@ def _whole(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _positive(value) -> bool:
+    """A finite number above 0 (JSON's Infinity would make a run unbounded)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
+def _budget_secret_problems(secret: str) -> list:
+    """What is wrong with the budgets secret; [] when nothing is. The problems are printed, so they
+    never quote a value of the secret."""
+    try:
+        budgets = json.loads(secret)
+    except json.JSONDecodeError:
+        budgets = None
+    if not isinstance(budgets, dict):
+        return [f"the secret {BUDGETS_ENV} must be a JSON object of tier names and budgets in USD"]
+    problems = [f"the secret {BUDGETS_ENV} has no budget for the tier '{name}'" for name in TIER_NAMES
+                if name not in budgets]
+    problems += [f"the secret {BUDGETS_ENV} names an unknown tier '{name}' (known: {', '.join(TIER_NAMES)})"
+                 for name in sorted(set(budgets) - set(TIER_NAMES))]
+    problems += [f"the budget of the tier '{name}' in the secret {BUDGETS_ENV} must be a number above 0"
+                 for name in TIER_NAMES if name in budgets and not _positive(budgets[name])]
+    return problems
+
+
+def tier_budget(tier_cfg: dict, tier: str, budgets: str) -> tuple:
+    """(USD, source) of the hard budget of one run of ``tier``: from the secret (``budgets``, its
+    text) when the caller passes it, else from the config's deprecated, public ``max_budget_usd``.
+    check-config has validated whichever applies. The amount is never printed."""
+    if budgets.strip():
+        return float(json.loads(budgets)[tier]), f"the secret {BUDGETS_ENV}"
+    return float(tier_cfg["max_budget_usd"]), f"the config (public; pass the secret {BUDGETS_ENV} instead)"
+
+
+#: A money amount in a text from the CLI: "$1,234.50", "7 USD", "USD 3". A run cut off by its budget
+#: may name the budget, and that text is published (log, job summary, summary comment).
+_AMOUNT = re.compile(r"\$\s?\d(?:[\d,]*\d)?(?:\.\d+)?|\b\d(?:[\d,]*\d)?(?:\.\d+)?\s?(?:USD|dollars?)\b"
+                     r"|\bUSD\s?\d(?:[\d,]*\d)?(?:\.\d+)?", re.IGNORECASE)
+
+
+def redact_amounts(text: str) -> str:
+    """``text`` with every money amount replaced by "[amount]"."""
+    return _AMOUNT.sub("[amount]", text)
+
+
 def _mapping(config: dict, key: str) -> dict:
     value = config.get(key)
     return value if isinstance(value, dict) else {}
 
 
-def config_problems(config, prompt_template) -> list:
+def config_problems(config, prompt_template, budgets: str = "") -> list:
     """Every reason why a gate config and its prompt would make a broken or unbounded review run;
     [] when there is none. ``prompt_template`` is the text of ``review.prompt_file``, or None when
-    that file cannot be read."""
+    that file cannot be read; ``budgets`` is the text of the secret CLAUDE_REVIEW_BUDGETS ("" when the
+    caller does not pass it). Every tier needs a budget from exactly one source: the secret, or,
+    deprecated, the config's public ``max_budget_usd``."""
     if not isinstance(config, dict):
         return ["the config is not a mapping of keys"]
+    secret = budgets.strip()
     problems = [f"unknown key '{key}' (known: {', '.join(CONFIG_KEYS)})" for key in sorted(set(config) - set(CONFIG_KEYS))]
+    if secret:
+        problems += _budget_secret_problems(secret)
     for section, keys in CONFIG_KEYS.items():
         if keys is None:
             continue
@@ -570,10 +644,13 @@ def config_problems(config, prompt_template) -> list:
             problems.append(f"'tiers.{name}.model' must be a model id")
         if not (_whole(tier.get("max_turns")) and tier["max_turns"] >= 1):
             problems.append(f"'tiers.{name}.max_turns' must be a whole number >= 1, got {tier.get('max_turns')!r}")
-        budget = tier.get("max_budget_usd")
-        if not (isinstance(budget, (int, float)) and not isinstance(budget, bool) and 0 < budget <= MAX_BUDGET_USD):
-            problems.append(f"'tiers.{name}.max_budget_usd' must be above 0 and at most {MAX_BUDGET_USD:g} USD "
-                            f"(the per-run cap), got {budget!r}")
+        if secret and "max_budget_usd" in tier:
+            problems.append(f"'tiers.{name}.max_budget_usd' must go: the secret {BUDGETS_ENV} holds the budgets, "
+                            "and the config is public")
+        elif not secret and not _positive(tier.get("max_budget_usd")):
+            # No value is quoted: a budget is not published.
+            problems.append(f"'tiers.{name}' has no budget: pass the secret {BUDGETS_ENV} (or, deprecated and "
+                            f"public, set 'tiers.{name}.max_budget_usd' to a number above 0)")
         if "effort" in tier and tier["effort"] not in EFFORT_LEVELS:
             # The CLI only warns on an unknown level and runs at the default, so a typo would silently
             # undo the chosen effort; reject it here instead.
@@ -627,24 +704,20 @@ def read_result_record(execution_file: Path) -> dict:
     return results[-1]
 
 
-def cost_summary(result: dict) -> dict:
-    if "total_cost_usd" not in result:
-        raise ValueError("result message carries no total_cost_usd")
-    usage = result.get("usage") or {}
+def run_outcome(result: dict) -> dict:
+    """How a review run ended, from the CLI's result record. It carries neither the API cost nor
+    the token counts, which give the cost at the public prices: it is uploaded as an artifact, and
+    every artifact of a public repository is public."""
+    if "num_turns" not in result:
+        raise ValueError("result message carries no num_turns")
     return {
-        "total_cost_usd": float(result["total_cost_usd"]),
-        "input_tokens": int(usage.get("input_tokens", 0)),
-        "output_tokens": int(usage.get("output_tokens", 0)),
-        "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0)),
-        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0)),
         "num_turns": int(result.get("num_turns", 0)),
         "duration_s": round(float(result.get("duration_ms", 0)) / 1000.0, 1),
         "is_error": bool(result.get("is_error", False)),
         "subtype": str(result.get("subtype", "unknown")),
         # On a failed run the result text carries the error (e.g. the API's message), which the
         # action itself hides in its log; keep it so the failure is diagnosable.
-        "error_text": str(result.get("result", ""))[:1000] if result.get("is_error") else "",
-        "model_usage": result.get("modelUsage", {}),
+        "error_text": redact_amounts(str(result.get("result", "")))[:1000] if result.get("is_error") else "",
     }
 
 
@@ -736,7 +809,8 @@ def review_prompt(template: str, repo: str, pr: int, tier: str, sha: str, diff_s
     return build_prompt(template, values, verbatim)
 
 
-def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list) -> list:
+def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_usd: float) -> list:
+    """The `claude -p` call of one review run; ``budget_usd`` is the tier's hard budget (tier_budget)."""
     # The tier's effort level, when the config sets one (check-config has validated it); without
     # it the CLI applies the model's default.
     effort = ["--effort", str(tier_cfg["effort"])] if tier_cfg.get("effort") else []
@@ -748,7 +822,7 @@ def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list) -> list
         "--model", str(tier_cfg["model"]),
         *effort,
         "--max-turns", str(int(tier_cfg["max_turns"])),
-        "--max-budget-usd", str(float(tier_cfg["max_budget_usd"])),
+        "--max-budget-usd", str(float(budget_usd)),
         "--output-format", "json",
         "--json-schema", json.dumps(FINDINGS_SCHEMA),
         # dontAsk denies every tool that is not pre-allowed; there is nobody to ask in CI.
@@ -820,7 +894,8 @@ def number_diff(diff_text: str) -> str:
 def read_findings(result: dict) -> dict:
     """Return the structured findings of a `claude -p --json-schema` result."""
     if result.get("is_error"):
-        raise ValueError(f"the review run failed: {' '.join(str(result.get('result', '')).split())[:500]}")
+        text = redact_amounts(" ".join(str(result.get("result", "")).split()))
+        raise ValueError(f"the review run failed: {text[:500]}")
     structured = result.get("structured_output")
     if structured is None:
         # Older CLI versions return the JSON only as the result text.
@@ -938,7 +1013,8 @@ def findings_record(placed: list, args, result: dict, summary: str, previous: li
     (~/.claude/retro, retro_reviews.py): every finding with its placement and, when inline,
     its comment id, so the retro can read whether the finding was fixed or rejected. Schema 2
     adds round, mode, scope, the verification of earlier findings and the dropped repeats; no
-    field of schema 1 changed."""
+    field of schema 1 changed. ``cost_usd`` is always None from v1.3.0 on: the key stays, since
+    schema 2 only adds fields, and the amount goes, since the artifact is public."""
     findings = [{"index": index, "severity": f.get("severity"), "path": f.get("path"), "line": f.get("line"),
                  "title": f.get("title"), "body": str(f.get("body", ""))[:1500], "scope": _scope(f),
                  "placement": f["placement"], "comment_id": f["comment_id"]} for index, f in enumerate(placed)]
@@ -946,16 +1022,19 @@ def findings_record(placed: list, args, result: dict, summary: str, previous: li
             "round": args.round, "mode": args.mode,
             "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
             "created": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
-            "cost_usd": result.get("total_cost_usd"), "num_turns": result.get("num_turns"),
+            "cost_usd": None, "num_turns": result.get("num_turns"),
             "summary": summary, "findings": findings, "previous": list(previous),
             "dropped_duplicates": dropped_duplicates}
 
 
 def round_delta(args, placed: list, resolved: list, result: dict, complete: bool) -> dict:
-    """The state of this round, to be merged into the stored state by upsert_summary."""
+    """The state of this round, to be merged into the stored state by upsert_summary. The round
+    keeps whether it called the model (the API reported a cost above zero), never the amount: the
+    state block is part of a public comment."""
     round_entry = {"round": args.round, "sha": args.sha, "tier": args.tier,
                    "run_id": os.environ.get("GITHUB_RUN_ID", ""), "automatic": args.mode != "forced",
-                   "complete": complete, "cost_usd": result.get("total_cost_usd"), "findings": len(placed)}
+                   "complete": complete, "model_call": float(result.get("total_cost_usd") or 0) > 0,
+                   "findings": len(placed)}
     # The run id is part of the finding id: two rounds on the same commit (a forced round after the
     # cap) must not give the same ids, or the newer finding replaces the older one in the state.
     run = os.environ.get("GITHUB_RUN_ID", "") or "local"
@@ -968,7 +1047,7 @@ def round_delta(args, placed: list, resolved: list, result: dict, complete: bool
 
 
 def summary_markdown(structured: dict, inline: list, summary_only: list, tier: str, sha: str,
-                     cost_line: str, state: dict | None = None, round_number: int = 1, still_open: list = (),
+                     run_line: str, state: dict | None = None, round_number: int = 1, still_open: list = (),
                      resolved: list = (), cap_reached: bool = False, dropped: int = 0,
                      force_label: str = "claude-review", fallback: str = "", failure: str = "",
                      verify_left: int = 0) -> str:
@@ -992,9 +1071,9 @@ def summary_markdown(structured: dict, inline: list, summary_only: list, tier: s
         parts += ["", "**Still open from earlier rounds:**", ""]
         parts += [f"- **{f['severity']}** `{f['path']}:{f['line']}`: {f['title']}" for f in still_open]
     if state and state.get("rounds"):
-        parts += ["", "| Round | Commit | Tier | Cost (USD) | New findings | Complete |", "|---|---|---|---|---|---|"]
+        parts += ["", "| Round | Commit | Tier | New findings | Complete |", "|---|---|---|---|---|"]
         parts += [f"| {r['round']} | `{str(r['sha'])[:12]}` | {r['tier']}{'' if r.get('automatic') else ' (forced)'} "
-                  f"| {float(r.get('cost_usd') or 0):.4f} | {r.get('findings', 0)} | {'yes' if r.get('complete') else 'no'} |"
+                  f"| {r.get('findings', 0)} | {'yes' if r.get('complete') else 'no'} |"
                   for r in state["rounds"]]
     if cap_reached:
         after = (f"a later push with open findings only gets a short check of its fixes (at most {verify_left} more "
@@ -1003,7 +1082,7 @@ def summary_markdown(structured: dict, inline: list, summary_only: list, tier: s
                       "for another review of the whole PR."]
     parts += ["", f"<sub>{len(inline)} inline, {len(summary_only)} summary-only"
                   + (f", {dropped} repeat(s) of open findings dropped" if dropped else "")
-                  + f". {cost_line} Advisory review, not a required check.</sub>"]
+                  + f". {run_line} Advisory review, not a required check.</sub>"]
     return "\n".join(parts) + "\n"
 
 
@@ -1171,6 +1250,7 @@ def _cmd_check_config(args) -> int:
     """Validate the calling repository's gate config and prompt; no model, no cost."""
     import yaml
 
+    budgets = os.environ.get(BUDGETS_ENV, "")
     try:
         config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as error:
@@ -1181,7 +1261,7 @@ def _cmd_check_config(args) -> int:
             template = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else None
         except OSError:
             template = None
-        problems = config_problems(config, template)
+        problems = config_problems(config, template, budgets=budgets)
     for problem in problems:
         print(f"::error::[claude-review] {args.config}: {problem}")
     if problems:
@@ -1189,13 +1269,18 @@ def _cmd_check_config(args) -> int:
                                        "no review runs until it is fixed:\n"
                                        + "".join(f"  - {problem}\n" for problem in problems))
         return 1
+    if not budgets.strip():
+        # The deprecated source: it still bounds every run, but its amounts are public.
+        print(f"::warning::[claude-review] {args.config}: the budgets per run come from the public config; pass the "
+              f"secret {BUDGETS_ENV} and remove max_budget_usd (TUBS-IVS/claude-pr-review, README.md)")
+    source = f"the secret {BUDGETS_ENV}" if budgets.strip() else "the config"
     print(f"[claude-review] config {args.config} and prompt {prompt_file}: OK (tiers {', '.join(TIER_NAMES)}, "
-          f"budget <= {MAX_BUDGET_USD:g} USD per run, tools {', '.join(config['review']['allowed_tools'])})")
+          f"budgets from {source}, tools {', '.join(config['review']['allowed_tools'])})")
     return 0
 
 
 def _cmd_classify(args) -> int:
-    import yaml  # only classify needs it; the cost step runs on a bare runner Python
+    import yaml  # only classify needs it; the outcome step runs on a bare runner Python
 
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     entries = parse_numstat(Path(args.numstat).read_text(encoding="utf-8"))
@@ -1303,42 +1388,36 @@ def _cmd_interdiff(args) -> int:
     return 0
 
 
-def _cmd_cost(args) -> int:
+def _cmd_outcome(args) -> int:
     try:
         if not args.execution_file:
             raise ValueError("empty execution file path (the action set no output)")
-        summary = cost_summary(read_result_record(Path(args.execution_file)))
+        outcome = run_outcome(read_result_record(Path(args.execution_file)))
     except (OSError, ValueError) as error:
-        print(f"error: no cost record: {error}", file=sys.stderr)
-        _append("GITHUB_STEP_SUMMARY", f"### Claude review cost\n\n**No cost record:** {error}\n")
+        print(f"error: no run record: {error}", file=sys.stderr)
+        _append("GITHUB_STEP_SUMMARY", f"### Claude review run\n\n**No run record:** {error}\n")
         return 1
-    summary.update({"tier": args.tier, "model": args.model})
-    # A run cut off by --max-turns or an API error still costs money but is not a complete review.
+    outcome.update({"tier": args.tier, "model": args.model})
+    # A run cut off by --max-turns or an API error is not a complete review.
     # The SDK can report subtype "success" together with is_error (an API error on the first call).
-    if summary["is_error"]:
-        status = "error" if summary["subtype"] == "success" else summary["subtype"]
+    if outcome["is_error"]:
+        status = "error" if outcome["subtype"] == "success" else outcome["subtype"]
     else:
-        status = "complete" if summary["subtype"] == "success" else summary["subtype"]
-    line = (f"[claude-review] {status}: cost ${summary['total_cost_usd']:.4f} USD, tier {args.tier or '-'}, "
-            f"model {args.model or '-'}, {summary['num_turns']} turns, {summary['duration_s']} s, "
-            f"tokens in {summary['input_tokens']} / out {summary['output_tokens']} / "
-            f"cache write {summary['cache_creation_input_tokens']} / cache read {summary['cache_read_input_tokens']}")
-    print(line)
+        status = "complete" if outcome["subtype"] == "success" else outcome["subtype"]
+    print(f"[claude-review] {status}: tier {args.tier or '-'}, model {args.model or '-'}, "
+          f"{outcome['num_turns']} turns, {outcome['duration_s']} s")
     if status != "complete":
-        print(f"::warning::Claude review did not complete ({status}); the cost is real, the review is partial.")
-    if summary["error_text"]:
+        print(f"::warning::Claude review did not complete ({status}); the review is partial.")
+    if outcome["error_text"]:
         # One line, so the workflow command is not cut at the first newline.
-        print(f"::error::Claude run error: {' '.join(summary['error_text'].split())}")
+        print(f"::error::Claude run error: {' '.join(outcome['error_text'].split())}")
     _append("GITHUB_STEP_SUMMARY",
-            "### Claude review cost\n\n| Status | Cost (USD) | Tier | Model | Turns | Duration (s) | Input | Output "
-            "| Cache write | Cache read |\n|---|---|---|---|---|---|---|---|---|---|\n"
-            f"| {status} | {summary['total_cost_usd']:.4f} | {args.tier or '-'} | {args.model or '-'} | {summary['num_turns']} "
-            f"| {summary['duration_s']} | {summary['input_tokens']} | {summary['output_tokens']} "
-            f"| {summary['cache_creation_input_tokens']} | {summary['cache_read_input_tokens']} |\n\n"
-            "Source: the `result` record of the Claude Code execution file (as reported by the API).\n"
-            + (f"\n**Run error:** `{' '.join(summary['error_text'].split())}`\n" if summary["error_text"] else ""))
+            "### Claude review run\n\n| Status | Tier | Model | Turns | Duration (s) |\n|---|---|---|---|---|\n"
+            f"| {status} | {args.tier or '-'} | {args.model or '-'} | {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
+            "Source: the `result` record of the Claude Code execution file.\n"
+            + (f"\n**Run error:** `{' '.join(outcome['error_text'].split())}`\n" if outcome["error_text"] else ""))
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        Path(args.json_out).write_text(json.dumps(outcome, indent=2), encoding="utf-8")
     return 0
 
 
@@ -1401,15 +1480,19 @@ def _cmd_review(args) -> int:
         # claude --bare authenticates only with this key; fail here with a clear message instead.
         print("::error::ANTHROPIC_API_KEY is not set; the review needs a workspace API key.")
         return 1
-    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"])
+    budget, source = tier_budget(tier_cfg, args.tier, os.environ.get(BUDGETS_ENV, ""))
+    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"], budget)
     print(f"[claude-review] running claude -p: tier {args.tier}, model {tier_cfg['model']}, "
           f"effort {tier_cfg.get('effort') or 'model default'}, max {tier_cfg['max_turns']} turns, "
-          f"budget {tier_cfg['max_budget_usd']} USD")
+          f"budget from {source}")
+    # The model's process gets no budgets: the model reads files, and what it writes is posted publicly.
+    child_env = {key: value for key, value in os.environ.items() if key != BUDGETS_ENV}
     # The prompt goes in on stdin: no argv length limit, and it is not echoed in process listings.
-    completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8")
+    completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                               env=child_env)
     Path(args.out).write_text(completed.stdout, encoding="utf-8")
     if completed.stderr.strip():
-        print(completed.stderr.strip()[-2000:], file=sys.stderr)
+        print(redact_amounts(completed.stderr.strip()[-2000:]), file=sys.stderr)
     print(f"[claude-review] claude exited with {completed.returncode}; result written to {args.out}")
     return completed.returncode
 
@@ -1429,12 +1512,12 @@ def _cmd_post(args) -> int:
         if float(result.get("total_cost_usd") or 0) <= 0:
             return 1
         # The run cost money but returned no findings (turn or budget cap, API error). It is still
-        # recorded, as an incomplete round with its cost, so it counts against rereview.max_rounds:
-        # otherwise a PR whose review fails every time is reviewed, and billed, again on every push
-        # (Claude review finding on a copy of this script). The step still fails.
+        # recorded, as an incomplete round that called the model, so it counts against
+        # rereview.max_rounds: otherwise a PR whose review fails every time is reviewed, and billed,
+        # again on every push (Claude review finding on a copy of this script). The step still fails.
         subtype = str(result.get("subtype") or "unknown")
         failure = (f"the run ended without a review ({'error' if subtype == 'success' else subtype}): {error}. "
-                   "Its cost counts against the automatic rounds; earlier findings stay open.")
+                   "It called the model, so it counts against the automatic rounds; earlier findings stay open.")
         structured = {"summary": "", "findings": [], "previous": [], "coverage_complete": False}
     config = {}
     if args.config:
@@ -1468,8 +1551,8 @@ def _cmd_post(args) -> int:
     if total and len(summary_only) == total:
         # Every finding off the diff usually means wrong paths or old-side line numbers, not a real pattern.
         print(f"::warning::All {total} findings point outside the diff; check path/line in the result.")
-    cost_line = (f"Cost {float(result.get('total_cost_usd', 0)):.4f} USD, {result.get('num_turns', '?')} turns."
-                 if "total_cost_usd" in result else "")
+    # The turns only: the comment is public, and the cost is not published (module docstring).
+    run_line = f"{result['num_turns']} turns." if "num_turns" in result else ""
     review = {"commit_id": args.sha, "event": "COMMENT",
               "body": "Claude review: inline findings below; the summary is in the Claude review comment.",
               "comments": inline}
@@ -1499,7 +1582,7 @@ def _cmd_post(args) -> int:
     if args.interdiff_dir and (Path(args.interdiff_dir) / "interdiff.json").exists():
         fallback = json.loads((Path(args.interdiff_dir) / "interdiff.json").read_text(encoding="utf-8")).get("fallback", "")
     body = summary_markdown(dict(structured, findings=findings), inline, summary_only, args.tier, args.sha,
-                            cost_line, preview, args.round, still_open, resolved, cap_reached, len(dropped),
+                            run_line, preview, args.round, still_open, resolved, cap_reached, len(dropped),
                             config.get("labels", {}).get("force", "claude-review"), fallback, failure,
                             verify_left=verify_left)
     if args.dry_run:
@@ -1703,12 +1786,12 @@ def main(argv=None) -> int:
                         help="author of the summary comment to update (the workflow token's identity)")
     p_post.set_defaults(func=_cmd_post)
 
-    p_cost = sub.add_parser("cost", help="report the API cost of a finished review")
-    p_cost.add_argument("--execution-file", required=True)
-    p_cost.add_argument("--tier", default="")
-    p_cost.add_argument("--model", default="")
-    p_cost.add_argument("--json", dest="json_out")
-    p_cost.set_defaults(func=_cmd_cost)
+    p_outcome = sub.add_parser("outcome", help="report how a finished review run ended (never its cost)")
+    p_outcome.add_argument("--execution-file", required=True)
+    p_outcome.add_argument("--tier", default="")
+    p_outcome.add_argument("--model", default="")
+    p_outcome.add_argument("--json", dest="json_out")
+    p_outcome.set_defaults(func=_cmd_outcome)
 
     args = parser.parse_args(argv)
     return args.func(args)
