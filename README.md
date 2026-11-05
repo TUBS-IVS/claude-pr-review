@@ -28,6 +28,9 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
 2. Give the repository access to the organization secret `CLAUDE_REVIEW_BUDGETS`: each tier's hard budget per run
    in USD as JSON, `{"light": <usd>, "full": <usd>, "deep": <usd>}`. The budgets are the owner's and are not published
    (the owner's decision of 2026-11-05), so they are in no config. These two secrets are all the shared workflow gets.
+   On GitHub Free an organization secret does not reach a private repository (GitHub Docs, "Using secrets in GitHub
+   Actions": "Organization-level secrets and variables are not accessible by private repositories for GitHub Free"),
+   so a private repository there needs a repository secret `CLAUDE_REVIEW_BUDGETS` of its own, with the same value.
 3. Copy [`examples/claude-review.yml`](examples/claude-review.yml) to `.github/workflows/claude-review.yml`. Keep that
    file name (the maintainer's session retro lists review runs by it). Adjust only the triggers: the base branch
    (`branches: [main]`) and, if needed, `paths-ignore` for files no review should ever start for.

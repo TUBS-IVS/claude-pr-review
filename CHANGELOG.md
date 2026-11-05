@@ -3,7 +3,7 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
-## v1.3.0 (unreleased)
+## v1.3.0 (2026-11-05)
 
 - No output of a review shows its API cost any more (the owner's decision of 2026-11-05). For a public repository the
   summary comment with its state block, the log and job summary of a run and its artifacts are all public.
@@ -19,7 +19,8 @@ major version, and callers name the major tag (README.md, "Versions"). The newes
   (`examples/claude-review.yml`). Only the gate and the review step get it, the model's own process does not, and no
   output names a budget. `check-config` validates it without quoting a value and refuses a `max_budget_usd` left in
   the config while the secret is set. A caller that does not pass the secret yet still runs on its config's
-  `max_budget_usd`, with a warning on every run; the code holds no upper bound for that value any more.
+  `max_budget_usd`, with a warning on every run; the code holds no upper bound for that value any more. On GitHub
+  Free a private repository does not get organization secrets and needs a repository secret of the same name.
 - A money amount in a text of the CLI that the review publishes (the error of a failed run, the CLI's own warnings in
   the log) is replaced by `[amount]`: a run cut off by its budget may name it.
 - The command `cost` is `outcome` now. File and artifact of the run record keep their v1 names.
