@@ -3,7 +3,7 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
-## v1.2.0 (unreleased)
+## v1.2.0 (2026-11-05)
 
 - A fix pushed after the last automatic round is still checked. Past `rereview.max_rounds`, a push with open
   findings gets up to `rereview.verify_after_cap` more rounds (new optional key, default 2) on
