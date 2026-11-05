@@ -30,7 +30,8 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
 3. Add the gate config `.github/claude-review.yml`. Start from a sibling repository's or from
    [`tests/fixtures/caller/.github/claude-review.yml`](tests/fixtures/caller/.github/claude-review.yml) and set its
    paths for your repository. Keys: `labels` (`force`, `skip`), `skip_drafts`, `critical_paths`, `structure_paths`,
-   `ignored_paths`, `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`), `tiers` (`light`, `full`,
+   `ignored_paths`, `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`, an optional
+   `verify_after_cap`: verify rounds for fixes after the cap, default 2), `tiers` (`light`, `full`,
    `deep`, each with `model`, `max_turns`, `max_budget_usd` of at most 50 USD and an optional `effort`: `low`,
    `medium`, `high`, `xhigh` or `max`; without it the model's default effort applies) and `review` (`prompt_file`,
    `allowed_tools` from Read, Grep, Glob). Make the caller, the config and the prompt critical paths.

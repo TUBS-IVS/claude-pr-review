@@ -75,6 +75,12 @@ STATE_END = " -->"
 # Outcome words of an author's reply, read the way the session retro reads them
 # (~/.claude/retro/bin/retro_reviews.py): whitespace collapsed, casefolded, "*_ " stripped.
 REJECTED_PREFIXES = ("rejected", "not changed")
+# The author's fix claim: it keeps a finding open for the next round's check, also in a resolved thread.
+FIXED_PREFIXES = ("fixed",)
+# Verify rounds a PR still gets after `rereview.max_rounds`, only for fixes of open findings (the owner's
+# decision of 2026-11-05: a fix pushed after the last round is still checked). ASSUMPTION: 2 bounds the
+# cost (a light-tier verify round cost 0.15 USD on 2026-11-05); a caller sets `rereview.verify_after_cap`.
+VERIFY_AFTER_CAP = 2
 # Our own verification replies; they must never be taken for the author's answer.
 BOT_REPLY_PREFIX = "re-review at"
 # The state is kept small: a finding that is no longer open keeps no text.
@@ -193,17 +199,21 @@ def refresh_state(state: dict, threads: dict) -> dict:
     """Bring the open findings up to date with what happened in their threads since the last round.
 
     Only findings that are still "open" change: a reply that starts with a rejection outcome word,
-    or a thread resolved by a human, makes the finding "dismissed" (the author closed it, so it is
-    not verified again); otherwise it stays open and the author's last reply is kept as a note for
-    the model. A finding the bot itself resolved stays "resolved", although GitHub shows its
-    thread as resolved too."""
+    or a thread resolved by a human without a fix claim, makes the finding "dismissed" (the author
+    closed it, so it is not verified again). A fix claim (a reply that starts with "Fixed") keeps it
+    open even in a resolved thread, so the next round checks the fix (2026-11-05: sessions resolve
+    their own threads after answering). An open finding keeps the author's last reply as a note for
+    the model. A finding the bot itself resolved stays "resolved", although GitHub shows its thread
+    as resolved too."""
     out = copy.deepcopy(state)
     for finding in out["findings"]:
         thread = threads.get(finding.get("comment_id"))
         if finding.get("status") != "open" or thread is None:
             continue
         author_replies = [r for r in thread.get("replies", []) if not _outcome_text(r).startswith(BOT_REPLY_PREFIX)]
-        if any(_outcome_text(r).startswith(REJECTED_PREFIXES) for r in author_replies) or thread.get("resolved"):
+        rejected = any(_outcome_text(r).startswith(REJECTED_PREFIXES) for r in author_replies)
+        claims_fix = any(_outcome_text(r).startswith(FIXED_PREFIXES) for r in author_replies)
+        if rejected or (thread.get("resolved") and not claims_fix):
             finding["status"] = "dismissed"
         elif author_replies:
             finding["author_note"] = " ".join(author_replies[-1].split())[:NOTE_CHARS]
@@ -439,15 +449,30 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
         return decide("none", f"skipped: label event for '{event_label}', not '{label_cfg['force']}'", "none", "none")
     if draft and config.get("skip_drafts", True):
         return decide("none", "skipped: draft PR", "none", "none")
+    verify = rereview["verify_tier"]
+    cap = int(rereview["max_rounds"])
+    extra = int(rereview.get("verify_after_cap", VERIFY_AFTER_CAP))
     # The cap holds for every push once rounds exist, also after a rebase (interdiff fallback):
-    # otherwise a force-push after the last round would buy a full review of the whole PR.
-    if context is not None and context.automatic_rounds >= int(rereview["max_rounds"]):
-        return decide("none", f"round cap: {context.automatic_rounds} automatic rounds; "
-                              f"add label '{label_cfg['force']}' for another", "none", "none")
+    # otherwise a force-push after the last round would buy a full review of the whole PR. Past it, a
+    # push with open findings still gets up to `verify_after_cap` verify rounds on the interdiff, so a
+    # fix after the last round is checked (the owner's decision of 2026-11-05); never a re-review.
+    if context is not None and context.automatic_rounds >= cap:
+        past = context.automatic_rounds - cap
+        if not (further and context.open_findings and past < extra):
+            return decide("none", f"round cap: {context.automatic_rounds} automatic rounds"
+                                  + (f", {past}/{extra} verify rounds after it" if extra else "")
+                                  + f"; add label '{label_cfg['force']}' for another", "none", "none")
+        step = f"verify after the round cap ({past + 1}/{extra})"
+        if not context.changed_entries:
+            if context.reverted:
+                return decide(verify, f"{step}: {len(context.reverted)} file(s) reverted to main since the last "
+                                      "complete round, open findings are checked at head", "verify", "none")
+            return decide("none", "skipped: nothing changed against main since the last complete round", "none", "none")
+        return decide(verify, f"{step}: {context.open_findings} open finding(s), their fixes are checked in the "
+                              "changes since the last complete round", "verify", "interdiff")
     if not further:
         tier, why = _size_tier(config, measured, structure, kind)
         return decide(tier, why, "first", "pr")
-    verify = rereview["verify_tier"]
     if not context.changed_entries:
         # Only a revert (a file back to main's state) can fix a finding without a changed file; a
         # merge of main alone cannot, so it gets no verify run (Claude review finding on PR #521).
@@ -484,6 +509,8 @@ CONFIG_KEYS = {"labels": ("force", "skip"), "skip_drafts": None, "critical_paths
                "structure_paths": None, "skip_kinds": None, "thresholds": THRESHOLD_KEYS,
                "rereview": ("max_rounds", "verify_tier"), "tiers": TIER_NAMES,
                "review": ("prompt_file", "allowed_tools")}
+#: Keys a section may have but need not: a caller's config from before the key existed stays valid.
+OPTIONAL_KEYS = {"rereview": ("verify_after_cap",)}
 #: Placeholders a prompt must contain: where the diff is, and the open findings of earlier rounds.
 REQUIRED_PLACEHOLDERS = ("DIFF_BLOCK", "ROUND_BLOCK")
 
@@ -510,8 +537,9 @@ def config_problems(config, prompt_template) -> list:
         if not isinstance(config.get(section), dict):
             problems.append(f"'{section}' is missing or not a mapping")
             continue
-        problems += [f"unknown key '{section}.{key}' (known: {', '.join(keys)})"
-                     for key in sorted(set(config[section]) - set(keys))]
+        known = tuple(keys) + OPTIONAL_KEYS.get(section, ())
+        problems += [f"unknown key '{section}.{key}' (known: {', '.join(known)})"
+                     for key in sorted(set(config[section]) - set(known))]
         problems += [f"'{section}.{key}' is missing" for key in keys if key not in config[section]]
     for key in ("critical_paths", "ignored_paths", "structure_paths", "skip_kinds"):
         value = config.get(key, [])
@@ -555,6 +583,8 @@ def config_problems(config, prompt_template) -> list:
         problems.append(f"'rereview.max_rounds' must be a whole number >= 1, got {rereview['max_rounds']!r}")
     if "verify_tier" in rereview and rereview["verify_tier"] not in TIER_NAMES:
         problems.append(f"'rereview.verify_tier' must be one of {', '.join(TIER_NAMES)}, got {rereview['verify_tier']!r}")
+    if "verify_after_cap" in rereview and not (_whole(rereview["verify_after_cap"]) and rereview["verify_after_cap"] >= 0):
+        problems.append(f"'rereview.verify_after_cap' must be a whole number >= 0, got {rereview['verify_after_cap']!r}")
     review = _mapping(config, "review")
     if "allowed_tools" in review:
         tools = review["allowed_tools"]
@@ -940,7 +970,8 @@ def round_delta(args, placed: list, resolved: list, result: dict, complete: bool
 def summary_markdown(structured: dict, inline: list, summary_only: list, tier: str, sha: str,
                      cost_line: str, state: dict | None = None, round_number: int = 1, still_open: list = (),
                      resolved: list = (), cap_reached: bool = False, dropped: int = 0,
-                     force_label: str = "claude-review", fallback: str = "", failure: str = "") -> str:
+                     force_label: str = "claude-review", fallback: str = "", failure: str = "",
+                     verify_left: int = 0) -> str:
     findings = _by_severity(structured["findings"])
     parts = [SUMMARY_MARKER, f"## Claude review (round {round_number}, {tier} tier, commit {sha[:12]})", "",
              f"**Review failed:** {failure}" if failure else structured["summary"], ""]
@@ -966,7 +997,9 @@ def summary_markdown(structured: dict, inline: list, summary_only: list, tier: s
                   f"| {float(r.get('cost_usd') or 0):.4f} | {r.get('findings', 0)} | {'yes' if r.get('complete') else 'no'} |"
                   for r in state["rounds"]]
     if cap_reached:
-        parts += ["", f"Automatic rounds used up: later pushes are not reviewed. Add the label `{force_label}` "
+        after = (f"a later push with open findings only gets a short check of its fixes (at most {verify_left} more "
+                 f"rounds)" if verify_left > 0 else "later pushes are not reviewed")
+        parts += ["", f"Automatic rounds used up: {after}. Add the label `{force_label}` "
                       "for another review of the whole PR."]
     parts += ["", f"<sub>{len(inline)} inline, {len(summary_only)} summary-only"
                   + (f", {dropped} repeat(s) of open findings dropped" if dropped else "")
@@ -1460,12 +1493,15 @@ def _cmd_post(args) -> int:
     preview = merge_state(state, delta)
     max_rounds = int(config.get("rereview", {}).get("max_rounds", 0) or 0)
     cap_reached = bool(max_rounds) and args.mode != "forced" and automatic_rounds(preview) >= max_rounds
+    verify_after_cap = int(config.get("rereview", {}).get("verify_after_cap", VERIFY_AFTER_CAP))
+    verify_left = max(0, max_rounds + verify_after_cap - automatic_rounds(preview)) if cap_reached else 0
     fallback = ""
     if args.interdiff_dir and (Path(args.interdiff_dir) / "interdiff.json").exists():
         fallback = json.loads((Path(args.interdiff_dir) / "interdiff.json").read_text(encoding="utf-8")).get("fallback", "")
     body = summary_markdown(dict(structured, findings=findings), inline, summary_only, args.tier, args.sha,
                             cost_line, preview, args.round, still_open, resolved, cap_reached, len(dropped),
-                            config.get("labels", {}).get("force", "claude-review"), fallback, failure)
+                            config.get("labels", {}).get("force", "claude-review"), fallback, failure,
+                            verify_left=verify_left)
     if args.dry_run:
         print("[claude-review] Summary comment:")
         print(body)
