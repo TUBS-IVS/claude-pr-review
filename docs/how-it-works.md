@@ -55,7 +55,9 @@ gate and the review step are the only steps that get the secret; the model's own
 fails on a secret that is not such an object, lacks a tier or holds anything but a positive number for one, and on a
 `max_budget_usd` left in the config while the secret is set; its messages never quote a value. A caller that does
 not pass the secret yet still runs on the deprecated `max_budget_usd` of its config (above 0), with a
-`::warning::` on every run; a tier with neither is a failure, so no run is unbounded.
+`::warning::` on every run; a tier with neither is a failure, so no run is unbounded. On GitHub Free an organization
+secret does not reach a private repository, which then holds a repository secret of the same name (README.md, "Adopt
+it in a repository").
 
 The thresholds, paths, labels, models and turn limits live in the calling repository's `.github/claude-review.yml`,
 not in code. Re-tune them from the run records below and the cost in the Anthropic Console ("Run record"). Decision
