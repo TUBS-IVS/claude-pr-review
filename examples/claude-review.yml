@@ -15,9 +15,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 # One queue per PR and event kind. A running review is never cancelled (its cost is already
-# spent and recorded only at the end); a newer push replaces a still-pending push run. Every
-# label event gets a group of its own label, so a triage label can neither cancel nor displace
-# a review, and a pending forced review (the force label) is not displaced by a later push.
+# spent, and its round is recorded only at the end); a newer push replaces a still-pending push
+# run. Every label event gets a group of its own label, so a triage label can neither cancel nor
+# displace a review, and a pending forced review (the force label) is not displaced by a later push.
 # It stays here, not in the called workflow: a group shared by both would deadlock.
 concurrency:
   group: >-

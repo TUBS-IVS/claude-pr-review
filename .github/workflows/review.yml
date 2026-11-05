@@ -7,7 +7,8 @@ name: Claude PR review
 #
 # A model-free gate job (claude_review.py check-config and classify, thresholds in the caller's
 # .github/claude-review.yml) decides whether a review runs and at which tier; only then is the API
-# called. Each review records its API cost in the job summary and as an artifact. The review posts
+# called. Each review records how its run ended (status, turns, duration) in the job summary and as
+# an artifact; no output shows the API cost (docs/how-it-works.md, "Run record"). The review posts
 # comments only; it is not a required check.
 #
 # The review runs in rounds: the state and interdiff commands read the earlier rounds from the bot's
@@ -137,7 +138,7 @@ jobs:
     needs: classify
     if: needs.classify.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # Runs of up to 19 minutes were seen; a job cut off by the timeout loses its cost record.
+    # Runs of up to 19 minutes were seen; a job cut off by the timeout loses its run record.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -215,13 +216,13 @@ jobs:
             --state "$RUNNER_TEMP/state.json" --interdiff-dir "$RUNNER_TEMP/interdiff" \
             --diff-source "$DIFF_SOURCE" --mode "$MODE" --round "$ROUND" \
             --out "$RUNNER_TEMP/claude-review-result.json"
-      - name: Record review cost
+      - name: Record how the review run ended
         if: always()
         run: |
-          python "$TOOL" cost --execution-file "$RUNNER_TEMP/claude-review-result.json" \
+          python "$TOOL" outcome --execution-file "$RUNNER_TEMP/claude-review-result.json" \
             --tier "$TIER" --model "$MODEL" --json claude-review-cost.json
-      # Also after a failed review step: a run that cost money is then recorded as an incomplete round,
-      # so it counts against the round cap; without a result the step only says so.
+      # Also after a failed review step: a run that called the model is then recorded as an incomplete
+      # round, so it counts against the round cap; without a result the step only says so.
       - name: Post review comments
         if: always()
         env:
@@ -233,7 +234,9 @@ jobs:
             --state "$RUNNER_TEMP/state.json" --interdiff-dir "$RUNNER_TEMP/interdiff" \
             --mode "$MODE" --round "$ROUND" \
             --record "$RUNNER_TEMP/claude-review-findings.json"
-      - name: Upload cost record
+      # The file and artifact keep their v1 names (README.md, "Contract with the session retro");
+      # since v1.3.0 the record carries no cost.
+      - name: Upload run record
         if: always()
         uses: actions/upload-artifact@v4
         with:

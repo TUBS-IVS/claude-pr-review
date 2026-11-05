@@ -3,7 +3,8 @@
 An advisory code review by Claude on pull requests, shared by the repositories of TUBS-IVS. A model-free gate
 decides from the size and kind of a change whether a review runs and with which model; the review reads the diff with
 read-only tools, posts its findings as inline comments and one summary comment, works in rounds (re-reviews only what
-changed, verifies fixes, stops after a cap) and records its API cost. It never blocks a merge.
+changed, verifies fixes, stops after a cap) and records how each run ended, never its API cost. It never blocks a
+merge.
 
 One repository, so that a fix is made once: the review ran as a copied script in six repositories before
 (ADR-0176 in [TUBS-IVS/eqasim-bs](https://github.com/TUBS-IVS/eqasim-bs)). Used by TUBS-IVS/eqasim-bs,
@@ -15,7 +16,7 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
 
 | Here (shared) | In each calling repository (its own) |
 |---|---|
-| `claude_review.py`: gate, review run, posting, cost and findings records | `.github/workflows/claude-review.yml`: the thin caller (triggers, queue, permissions) |
+| `claude_review.py`: gate, review run, posting, run and findings records | `.github/workflows/claude-review.yml`: the thin caller (triggers, queue, permissions) |
 | `.github/workflows/review.yml`: the reusable workflow with the two jobs | `.github/claude-review.yml`: the gate config (paths, thresholds, tiers, labels) |
 | `tests/`: the tests of the script and of both workflows | `.github/claude-review-prompt.md`: the prompt (what to look for, which rules to read) |
 | `examples/claude-review.yml`: the caller template | `.claude/rules/`: project rules the prompt tells the review to read |
@@ -73,7 +74,8 @@ test branch runs the new version end to end. Close that pull request without mer
 
 The maintainer's session retro (outside this repository) learns from confirmed findings. It relies on: the caller's
 file name `claude-review.yml`, the artifact names `claude-review-findings-pr<NN>-run<id>-<attempt>` and
-`claude-review-cost-pr<NN>-run<id>-<attempt>`, the findings record (`schema: 2`, fields only added), the state block
+`claude-review-cost-pr<NN>-run<id>-<attempt>` (the run record, without any cost since v1.3.0), the findings record
+(`schema: 2`, fields only added), the state block
 `<!-- claude-pr-review:state ... -->` of the summary comment, and the reply words: answer each finding's thread with
 `Fixed ...` or `Rejected: ...` (docs/how-it-works.md, "Learning from the findings").
 

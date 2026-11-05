@@ -1,11 +1,12 @@
-"""Gate, posting and cost record of the automatic Claude PR review (claude_review.py).
+"""Gate, posting and run record of the automatic Claude PR review (claude_review.py).
 
 Defects caught: a review that runs (and costs) on a docs-only or generated-file PR, a
 critical-path change that is skipped, an unrelated label event that re-triggers a paid
-review, rename/binary numstat lines that crash or count wrongly, a missing cost record
+review, rename/binary numstat lines that crash or count wrongly, a missing run record
 reported as a silent zero, a finding off the diff that breaks the whole PR review (GitHub
 rejects inline comments outside the diff) or silently disappears, a failed run posted as
-an empty review, a prompt placeholder left unfilled, and an unbounded review run.
+an empty review, a prompt placeholder left unfilled, an unbounded review run, and an API
+cost or token count in any public output of a run.
 """
 import copy
 import importlib.util
@@ -136,7 +137,7 @@ def test_classify_cli_writes_github_output(tmp_path, monkeypatch, capsys):
     assert "added" in values["reason"] and "configs/base_bs.yml" in values["reason"]
 
 
-def test_cost_reads_result_record_and_fails_loudly_without_one(tmp_path, monkeypatch, capsys):
+def test_outcome_reads_result_record_and_fails_loudly_without_one(tmp_path, monkeypatch, capsys):
     execution = tmp_path / "exec.json"
     execution.write_text(json.dumps([
         {"type": "system", "subtype": "init"},
@@ -145,14 +146,12 @@ def test_cost_reads_result_record_and_fails_loudly_without_one(tmp_path, monkeyp
          "usage": {"input_tokens": 120, "output_tokens": 3400,
                    "cache_creation_input_tokens": 40000, "cache_read_input_tokens": 150000}},
     ]), encoding="utf-8")
-    out = tmp_path / "cost.json"
-    assert cr.main(["cost", "--execution-file", str(execution), "--tier", "full", "--json", str(out)]) == 0
-    summary = json.loads(out.read_text(encoding="utf-8"))
-    assert summary["total_cost_usd"] == pytest.approx(0.4213)
-    assert (summary["num_turns"], summary["duration_s"], summary["output_tokens"]) == (7, 81.5, 3400)
-    assert summary["cache_read_input_tokens"] == 150000 and summary["tier"] == "full"
+    out = tmp_path / "run.json"
+    assert cr.main(["outcome", "--execution-file", str(execution), "--tier", "full", "--json", str(out)]) == 0
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert (record["num_turns"], record["duration_s"], record["tier"]) == (7, 81.5, "full")
     # a review cut off by --max-turns is reported as partial, not as a normal review
-    assert summary["subtype"] == "error_max_turns"
+    assert record["subtype"] == "error_max_turns"
     assert "::warning::" in capsys.readouterr().out
 
     # an API error on the first call: the SDK says subtype "success" with is_error; the error
@@ -160,7 +159,7 @@ def test_cost_reads_result_record_and_fails_loudly_without_one(tmp_path, monkeyp
     execution.write_text(json.dumps([{"type": "result", "subtype": "success", "is_error": True,
                                       "total_cost_usd": 0, "num_turns": 1,
                                       "result": "API Error: 400 model not supported"}]), encoding="utf-8")
-    assert cr.main(["cost", "--execution-file", str(execution), "--json", str(out)]) == 0
+    assert cr.main(["outcome", "--execution-file", str(execution), "--json", str(out)]) == 0
     printed = capsys.readouterr().out
     assert "[claude-review] error:" in printed and "::error::Claude run error: API Error: 400" in printed
     assert json.loads(out.read_text(encoding="utf-8"))["error_text"].startswith("API Error: 400")
@@ -168,10 +167,10 @@ def test_cost_reads_result_record_and_fails_loudly_without_one(tmp_path, monkeyp
     execution.write_text(json.dumps([{"type": "assistant"}]), encoding="utf-8")
     step_summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
-    assert cr.main(["cost", "--execution-file", str(execution)]) == 1
-    assert "No cost record" in step_summary.read_text(encoding="utf-8")
+    assert cr.main(["outcome", "--execution-file", str(execution)]) == 1
+    assert "No run record" in step_summary.read_text(encoding="utf-8")
     # an empty path (the action set no output) is named as such, not read as the cwd directory
-    assert cr.main(["cost", "--execution-file", ""]) == 1
+    assert cr.main(["outcome", "--execution-file", ""]) == 1
     assert "empty execution file path" in step_summary.read_text(encoding="utf-8")
 
 
@@ -224,10 +223,10 @@ def test_post_dry_run_places_findings_on_diff_lines_and_keeps_the_rest_in_the_su
     assert review["commit_id"] == "abcdef1234567890" and review["event"] == "COMMENT"
     summary = out.split("[claude-review] Summary comment:\n", 1)[1]
     assert cr.SUMMARY_MARKER in summary and "Off diff" in summary.split("Not on a changed line", 1)[1]
-    assert "inline 2, summary-only 1" in out and "0.8100 USD" in summary
+    assert "inline 2, summary-only 1" in out and "9 turns" in summary
     # the record the session retro learns from: every finding, its placement, no ids in a dry run
     record = json.loads(record_path.read_text(encoding="utf-8"))
-    assert (record["repo"], record["pr"], record["head_sha"], record["cost_usd"]) == ("o/r", 5, "abcdef1234567890", 0.81)
+    assert (record["repo"], record["pr"], record["head_sha"], record["num_turns"]) == ("o/r", 5, "abcdef1234567890", 9)
     assert [(f["title"], f["placement"], f["comment_id"]) for f in record["findings"]] == [
         ("Wrong x", "inline", None), ("Off diff", "summary", None), ("Context line", "inline", None)]
     # schema 2 only adds fields; a result from before the scope field reads as "introduced"
@@ -302,7 +301,7 @@ def test_a_failed_run_that_cost_money_is_recorded_and_counts_against_the_cap(tmp
     assert cr.main(post + ["--result", str(result)]) == 1          # the failure stays visible in CI
     state = cr.decode_state(written[-1])
     assert state["rounds"][-1] == {"round": 2, "sha": "d" * 40, "tier": "full", "run_id": "78", "automatic": True,
-                                   "complete": False, "cost_usd": 0.42, "findings": 0}
+                                   "complete": False, "model_call": True, "findings": 0}
     assert cr.automatic_rounds(state) == 2 and cr.last_complete_sha(state) == "c" * 40
     assert [f["status"] for f in state["findings"]] == ["open", "open"]
     visible = cr.strip_state(written[-1])
@@ -312,6 +311,117 @@ def test_a_failed_run_that_cost_money_is_recorded_and_counts_against_the_cap(tmp
     written.clear()
     assert cr.main(post + ["--result", str(tmp_path / "missing.json")]) == 1
     assert "no review result" in capsys.readouterr().out and not written
+
+
+# What no public output may show (the owner's request of 2026-11-05): the API cost of a run and its
+# token counts, which give the cost at the public prices. Distinct values, so a hit is never a coincidence.
+_RESULT_WITH_COST = {
+    "type": "result", "is_error": False, "total_cost_usd": 7.3519, "num_turns": 19, "duration_ms": 81500,
+    "usage": {"input_tokens": 41213, "output_tokens": 52907, "cache_creation_input_tokens": 63311,
+              "cache_read_input_tokens": 74419},
+    "modelUsage": {"claude-opus-5-5": {"inputTokens": 41213, "outputTokens": 52907, "costUSD": 7.3519}}}
+
+
+def _cost_leaks(text: str, words: bool = True) -> list:
+    """The parts of the cost that a public text still shows: an amount, a token count, or (with
+    ``words``) a word that labels one."""
+    found = [n for n in ("7.35", "41213", "52907", "63311", "74419") if n in text]
+    return found + ([w for w in ("usd", "cost", "token") if w in text.lower()] if words else [])
+
+
+@pytest.mark.parametrize("subtype, structured", [
+    ("success", {"summary": "One bug.", "findings": [], "previous": [], "coverage_complete": True}),
+    # cut off by its turn cap: no review, but the model was called, so the round is recorded
+    ("error_max_turns", None),
+])
+def test_no_public_output_of_a_review_shows_its_cost(tmp_path, monkeypatch, capsys, subtype, structured):
+    # For a public repository every output of a run is public: the summary comment with its state
+    # block, the log and the job summary of the run, and both artifacts.
+    result = dict(_RESULT_WITH_COST, subtype=subtype)
+    if structured is not None:
+        result["structured_output"] = structured
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(_state_with_open()), encoding="utf-8")
+    step_summary = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
+    monkeypatch.setenv("GITHUB_RUN_ID", "78")
+    written = []
+
+    def fake_gh_api(args, payload=None):
+        if args[0].endswith("/pulls/5") and "--jq" in args:
+            return "d" * 40
+        if args[0].endswith("/issues/5/comments") and "--method" not in args:
+            return "101"
+        if args[0].endswith("/issues/comments/101") and "--method" not in args:
+            return json.dumps({"body": cr.SUMMARY_MARKER + "\nround 1 text\n" + cr.encode_state(_state_with_open())})
+        if "PATCH" in args:
+            written.append(payload["body"])
+        return "{}"
+
+    monkeypatch.setattr(cr, "_gh_api", fake_gh_api)
+    run_record, findings_record = tmp_path / "run.json", tmp_path / "findings.json"
+    assert cr.main(["outcome", "--execution-file", str(result_path), "--tier", "full", "--model", "m",
+                    "--json", str(run_record)]) == 0
+    rc = cr.main(["post", "--config", str(_CONFIG_PATH), "--result", str(result_path), "--repo", "o/r", "--pr", "5",
+                  "--tier", "full", "--sha", "d" * 40, "--diff-file", str(result_path), "--state", str(state_path),
+                  "--mode", "rereview", "--round", "2", "--record", str(findings_record)])
+    assert rc == (0 if structured else 1)
+    # without the amount the round still counts against the cap: it called the model
+    assert cr.decode_state(written[-1])["rounds"][-1]["model_call"] is True
+    for name, text in (("summary comment", written[-1]), ("log", capsys.readouterr().out),
+                       ("job summary", step_summary.read_text(encoding="utf-8")),
+                       ("run record", run_record.read_text(encoding="utf-8"))):
+        assert _cost_leaks(text) == [], name
+    # the findings record keeps its key (schema 2 only adds fields), empty
+    record = json.loads(findings_record.read_text(encoding="utf-8"))
+    assert record["cost_usd"] is None and _cost_leaks(findings_record.read_text(encoding="utf-8"), words=False) == []
+
+
+@pytest.mark.parametrize("result, model_call", [
+    ({"total_cost_usd": 0.2}, True),
+    # no model call (only ignored files changed, the result `review` writes itself) and a result without a cost:
+    # a round that must not use up an automatic round
+    ({"total_cost_usd": 0.0}, False),
+    ({}, False),
+])
+def test_a_round_records_whether_it_called_the_model_and_not_what_it_cost(result, model_call):
+    args = type("A", (), {"round": 1, "sha": "h" * 40, "tier": "light", "mode": "first"})()
+    round_ = cr.round_delta(args, [], [], result, True)["rounds"][0]
+    assert round_["model_call"] is model_call and "cost_usd" not in round_
+    assert cr.automatic_rounds({"rounds": [round_]}) == int(model_call)
+
+
+def test_a_state_block_from_before_v1_3_0_keeps_its_round_cap_and_loses_its_amounts(monkeypatch):
+    # A summary comment written before v1.3.0 carries the cost of each round in its state block. Read
+    # by v1.3.0, a round keeps whether it called the model (cost above zero), so the round cap of an
+    # open PR still holds; the next write of the comment no longer carries the amounts.
+    legacy = cr.SUMMARY_MARKER + "\nold text\n" + cr.encode_state({"schema": 1, "findings": [], "rounds": [
+        {"round": 1, "sha": "a" * 40, "tier": "full", "run_id": "1", "automatic": True, "complete": True,
+         "cost_usd": 7.3519, "findings": 2},
+        {"round": 2, "sha": "b" * 40, "tier": "light", "run_id": "2", "automatic": True, "complete": False,
+         "cost_usd": 0.0, "findings": 0}]})
+    state = cr.decode_state(legacy)
+    assert [r.get("model_call") for r in state["rounds"]] == [True, False]
+    assert cr.automatic_rounds(state) == 1 and _cost_leaks(json.dumps(state)) == []
+    calls = []
+
+    def fake_gh_api(args, payload=None):
+        calls.append((args, payload))
+        if args[0].endswith("/issues/5/comments") and "--method" not in args:
+            return "101"
+        if args[0].endswith("/issues/comments/101") and "--method" not in args:
+            return json.dumps({"body": legacy})
+        return "{}"
+
+    monkeypatch.setattr(cr, "_gh_api", fake_gh_api)
+    delta = {"schema": 1, "findings": [], "rounds": [{"round": 3, "sha": "c" * 40, "tier": "light", "run_id": "3",
+                                                      "automatic": True, "complete": True, "model_call": True,
+                                                      "findings": 0}]}
+    cr.upsert_summary("o/r", 5, "github-actions[bot]", cr.SUMMARY_MARKER + "\nnew text\n", state_delta=delta)
+    written = [p["body"] for a, p in calls if p and "PATCH" in a][-1]
+    assert _cost_leaks(written) == [] and cr.automatic_rounds(cr.decode_state(written)) == 2
 
 
 def test_the_fixture_prompt_and_tiers_give_a_bounded_read_only_run():
@@ -544,7 +654,7 @@ def test_refresh_state_keeps_a_fix_open_for_verification_even_when_its_thread_wa
     (0, "later pushes are not reviewed"),
 ])
 def test_the_summary_says_what_happens_after_the_round_cap(verify_left, expected):
-    body = cr.summary_markdown({"summary": "s", "findings": []}, [], [], "light", "c" * 40, "Cost 0.1 USD.",
+    body = cr.summary_markdown({"summary": "s", "findings": []}, [], [], "light", "c" * 40, "5 turns.",
                                cap_reached=True, verify_left=verify_left)
     assert expected in body and "Add the label `claude-review` for another review of the whole PR." in body
 
@@ -577,11 +687,11 @@ def test_state_cli_reads_the_summary_and_logs_the_fallback_for_a_summary_without
 
 def test_merge_state_keys_rounds_by_commit_and_run_and_findings_by_id():
     existing = {"schema": 1, "rounds": [{"round": 1, "sha": "a" * 40, "run_id": "1", "automatic": True, "complete": True,
-                                          "tier": "full", "cost_usd": 1.0, "findings": 1}],
+                                          "tier": "full", "model_call": True, "findings": 1}],
                 "findings": [{"id": "aaaaaaaaaaaa-0", "status": "open", "body": "b", "author_note": "n", "path": "a.py",
                               "line": 1, "severity": "high", "scope": "introduced", "title": "t", "comment_id": 7}]}
     delta = {"schema": 1, "rounds": [{"round": 2, "sha": "b" * 40, "run_id": "2", "automatic": True, "complete": False,
-                                       "tier": "light", "cost_usd": 0.2, "findings": 0}],
+                                       "tier": "light", "model_call": True, "findings": 0}],
              "findings": [{"id": "aaaaaaaaaaaa-0", "status": "resolved", "body": "b", "author_note": "n", "path": "a.py",
                            "line": 1, "severity": "high", "scope": "introduced", "title": "t", "comment_id": 7}]}
     merged = cr.merge_state(existing, delta)
@@ -591,7 +701,7 @@ def test_merge_state_keys_rounds_by_commit_and_run_and_findings_by_id():
     # against the cap: otherwise a PR the model never reads in full is reviewed on every push
     # without limit (Claude review finding on PR #521). A round without a model call is free.
     assert cr.last_complete_sha(merged) == "a" * 40 and cr.automatic_rounds(merged) == 2
-    free = dict(delta["rounds"][0], sha="c" * 40, run_id="3", cost_usd=0.0)
+    free = dict(delta["rounds"][0], sha="c" * 40, run_id="3", model_call=False)
     assert cr.automatic_rounds(cr.merge_state(merged, dict(delta, rounds=[free]))) == 2
     # the same round posted twice (a retry) is one round
     assert len(cr.merge_state(merged, delta)["rounds"]) == 2
@@ -825,7 +935,7 @@ def test_classify_cli_reads_state_and_interdiff_and_writes_mode_and_round(tmp_pa
 def _state_with_open():
     state = cr.empty_state()
     state["rounds"].append({"round": 1, "sha": "c" * 40, "tier": "full", "run_id": "1", "automatic": True,
-                            "complete": True, "cost_usd": 1.0, "findings": 2})
+                            "complete": True, "model_call": True, "findings": 2})
     state["findings"] += [
         {"id": "cccccccccccc-0", "path": "braunschweig/a.py", "line": 41, "severity": "high", "scope": "introduced",
          "title": "Wrong x", "body": "x is 1", "author_note": "Fixed in 1a2b3c", "comment_id": 11, "status": "open"},
@@ -895,7 +1005,7 @@ def test_upsert_summary_merges_the_state_and_a_stale_run_keeps_the_visible_text(
 
     monkeypatch.setattr(cr, "_gh_api", fake_gh_api)
     delta = {"schema": 1, "rounds": [{"round": 3, "sha": "e" * 40, "tier": "light", "run_id": "9", "automatic": True,
-                                       "complete": False, "cost_usd": 0.1, "findings": 1}],
+                                       "complete": False, "model_call": True, "findings": 1}],
              "findings": [{"id": "eeeeeeeeeeee-0", "path": "a.py", "line": 1, "severity": "low", "scope": "introduced",
                            "title": "t", "body": "b", "author_note": "", "comment_id": 5, "status": "open"}]}
     cr.upsert_summary("o/r", 5, "github-actions[bot]", "## Claude review (round 3)\n\nolder commit\n", stale=True,
@@ -929,7 +1039,7 @@ def test_a_stale_round_does_not_become_the_last_reviewed_commit(monkeypatch):
     # "last complete" commit, and the next interdiff would review already reviewed files again.
     existing = "## s\n" + cr.encode_state({"schema": 1, "findings": [], "rounds": [
         {"round": 1, "sha": "n" * 40, "tier": "light", "run_id": "2", "automatic": True, "complete": True,
-         "cost_usd": 0.1, "findings": 0}]})
+         "model_call": True, "findings": 0}]})
     calls = []
 
     def fake_gh_api(args, payload=None):
@@ -942,7 +1052,7 @@ def test_a_stale_round_does_not_become_the_last_reviewed_commit(monkeypatch):
 
     monkeypatch.setattr(cr, "_gh_api", fake_gh_api)
     delta = {"schema": 1, "findings": [], "rounds": [{"round": 2, "sha": "o" * 40, "tier": "full", "run_id": "1",
-                                                      "automatic": False, "complete": True, "cost_usd": 1.0, "findings": 0}]}
+                                                      "automatic": False, "complete": True, "model_call": True, "findings": 0}]}
     cr.upsert_summary("o/r", 5, "github-actions[bot]", "older", stale=True, state_delta=delta)
     merged = cr.decode_state([p["body"] for a, p in calls if p and "PATCH" in a][-1])
     assert cr.last_complete_sha(merged) == "n" * 40
@@ -1112,7 +1222,10 @@ def test_the_reusable_workflow_wires_the_gate_and_the_rounds():
     # A failed review step must still reach `post`, which records the round so it counts against the cap.
     post_step = next(s for s in review_job["steps"] if '"$TOOL" post ' in s.get("run", ""))
     assert post_step.get("if") == "always()"
-    # The session retro downloads the findings records by this name; the cost record keeps its name too.
+    # A run cut off by an error still says how it ended.
+    outcome_step = next(s for s in review_job["steps"] if '"$TOOL" outcome ' in s.get("run", ""))
+    assert outcome_step.get("if") == "always()" and "--json claude-review-cost.json" in outcome_step["run"]
+    # The session retro downloads the findings records by this name; the run record keeps its v1 name too.
     uploads = {s["with"]["name"]: s for s in review_job["steps"] if s.get("uses", "").startswith("actions/upload-artifact@")}
     suffix = "-pr${{ github.event.pull_request.number }}-run${{ github.run_id }}-${{ github.run_attempt }}"
     assert set(uploads) == {"claude-review-findings" + suffix, "claude-review-cost" + suffix}

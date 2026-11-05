@@ -27,7 +27,7 @@ Code; runs started by the Claude Code GitHub Action count as Claude Code usage (
 credits for Max and Team plans", article 17154008; Claude Platform docs, "API credits for Max and Team plans"). The
 action identifies its traffic as such (`CLAUDE_CODE_ENTRYPOINT = "claude-code-github-action"` in its
 `base-action/src/parse-sdk-options.ts`). On PR #497 every action run failed on its first API call with "Credit
-balance is too low" at 0 USD, although the organization held 420 USD of these credits. The workflow therefore runs
+balance is too low", although the organization held such credits. The workflow therefore runs
 `claude -p` itself. Should the balance ever be purchased credits instead, the action would work again; the reasons
 above then no longer apply.
 
@@ -36,7 +36,7 @@ above then no longer apply.
 | Job | Calls the API | Does |
 |---|---|---|
 | `classify` | no | `check-config` (see below), `state` and `interdiff` (see "Rounds"), then `classify`: reads `git diff --numstat base...head` and `--name-status -M base...head`, the branch kind, labels, draft state, the state and the interdiff, and decides `none` / `light` / `full` / `deep` plus the outputs `mode`, `diff_source`, `round` |
-| `review` | yes, only if `classify` says so | installs the pinned Claude Code CLI, recomputes `state` and `interdiff` (no artifact travels between the jobs), `review` (runs `claude -p`), `cost`, `post` |
+| `review` | yes, only if `classify` says so | installs the pinned Claude Code CLI, recomputes `state` and `interdiff` (no artifact travels between the jobs), `review` (runs `claude -p`), `outcome`, `post` |
 
 **`check-config` comes first.** It validates the calling repository's config and the prompt it names
 (`config_problems`) and fails the gate job, before anything is spent, with one `::error::` line per problem: a key the
@@ -47,7 +47,8 @@ no tier, equal force and skip labels, or a prompt with an unknown placeholder, w
 `{{ROUND_BLOCK}}`, or with `{{PR_BODY}}` outside two `{{FENCE}}` lines. Fork and Dependabot PRs are skipped before it.
 
 The thresholds, paths, labels, models, turn and budget limits live in the calling repository's
-`.github/claude-review.yml`, not in code. Re-tune them from the cost records below. Decision order (`classify`; the
+`.github/claude-review.yml`, not in code. Re-tune them from the run records below and the cost in the Anthropic
+Console ("Run record"). Decision order (`classify`; the
 first-round order, a PR without a complete round on record, is below, the further-round order is in "Rounds"):
 
 1. Label `labels.skip` -> no review.
@@ -68,9 +69,9 @@ first-round order, a PR without a complete round on record, is below, the furthe
 The three tiers and why the deep one exists: ADR-0175 in TUBS-IVS/eqasim-bs. `structure_paths` names the backbone of
 a repository; keep it a short list, so that routine additions stay full-tier changes.
 
-Runs queue per PR and event kind, and a running review is never cancelled: its cost is already spent and is recorded
-only at the end. A newer push replaces a still-pending push run. Every label event runs in a concurrency group of its
-own label, so a triage label cannot displace a review, and a pending forced review is not displaced by a later push
+Runs queue per PR and event kind, and a running review is never cancelled: its cost is already spent, and its round is
+recorded only at the end. A newer push replaces a still-pending push run. Every label event runs in a concurrency group
+of its own label, so a triage label cannot displace a review, and a pending forced review is not displaced by a later push
 (a Claude review finding on PR #497: with one shared group, the push replaced the pending forced run and the push run
 was then gated normally). The concurrency block lives in the caller (`examples/claude-review.yml`): a called workflow
 sees the caller's `github` context, and a group shared by caller and called workflow deadlocks.
@@ -87,7 +88,7 @@ Why the review works in rounds: ADR-0171 in TUBS-IVS/eqasim-bs.
 **State.** The bot's summary comment carries a second hidden block, `STATE_MARKER`
 (`<!-- claude-pr-review:state <json> -->`), written by `post` (`encode_state`, which escapes `>` as the JSON escape
 `>` so the JSON never contains `-->`) and read by `decode_state`. Schema 1: `rounds` (`round`, `sha`, `tier`,
-`run_id`, `automatic`, `complete`, `cost_usd`, `findings`) and `findings` (`id` = `<sha12>-<run id>-<index>`, so two
+`run_id`, `automatic`, `complete`, `model_call`, `findings`) and `findings` (`id` = `<sha12>-<run id>-<index>`, so two
 rounds on the same commit, e.g. a forced round after the cap, never share an id; `path`, `line`, `severity`,
 `scope`, `title`, `comment_id`, `status`, and for open ones `body` and `author_note`; caps `TITLE_CHARS`,
 `BODY_CHARS`, `NOTE_CHARS`). `status` is `open`, `resolved` (a later round verified the fix) or `dismissed`
@@ -98,7 +99,10 @@ checks the fix; the bot's own `Re-review at ...` reply never dismisses, and only
 model. `post` re-reads the comment and merges rounds and findings (`merge_state`) before writing, so a run for a
 commit that is no longer the head still records its findings but leaves the visible summary text alone; its round is
 marked `stale` and never becomes the last reviewed commit. Threads of resolved findings are closed only after the state
-is written.
+is written. `model_call` says whether the round called the model (the API reported a cost above zero); the block is
+part of a public comment, so it never holds the amount ("Run record"). A block written before v1.3.0 carries
+`cost_usd` per round instead: `decode_state` turns it into `model_call` and drops the amount, so the round cap of an
+open PR still holds and the next write of the comment no longer shows it.
 
 **Commands, both model-free.** `state --repo --pr --out` reads the comment and the threads of open findings and writes
 `state.json`. `interdiff --config --state --base-sha --head-sha --out-dir` compares `git diff base...last` and
@@ -109,7 +113,7 @@ reverted paths; a renamed file is changed). `last` is the last round with `compl
 
 **Decision order of a further round** (a state with a complete round, a push-like event): skip label, other label
 events and drafts as in the first round; then `rereview.max_rounds` automatic rounds that called the model
-(`automatic_rounds`: complete or not, cost above zero; `complete` only moves the reviewed commit) reached -> none
+(`automatic_rounds`: complete or not, `model_call` true; `complete` only moves the reviewed commit) reached -> none
 (`round cap`), except that a push with open findings and a usable interdiff still gets up to
 `rereview.verify_after_cap` (optional, default `VERIFY_AFTER_CAP` = 2) more rounds on `rereview.verify_tier`, which
 check the fixes in the interdiff and are never a re-review of the push (the owner's decision of 2026-11-05: a fix
@@ -135,15 +139,15 @@ cap. It still gets the open findings.
   applies, and the prompt tells the model that the line numbers of the open findings may have moved.
 - A PR with more than 100 review threads: `::warning::`; findings beyond the first page keep their status (the same
   single page the session retro reads).
-- No model call (only ignored files changed, nothing open): the round is recorded with `complete: false` and a cost of
-  0, so it neither uses up an automatic round nor moves the reviewed commit.
+- No model call (only ignored files changed, nothing open): the round is recorded with `complete: false` and
+  `model_call: false`, so it neither uses up an automatic round nor moves the reviewed commit.
 - A result without `coverage_complete` is counted as complete, with a `::warning::`; a result with
   `coverage_complete: false` is recorded with `complete: false` and does not advance the reviewed commit.
 - A run that cost money but returned no findings (turn or budget cap, API error): `post` (which the workflow runs
-  `if: always()`) records it as a round with `complete: false` and its cost, so it counts against the cap; the summary
-  says `**Review failed:**` with the reason, the open findings stay open, and the step still fails. A failed run
-  without cost records nothing (a Claude review finding on a copy of this script: such runs were never recorded, so a
-  review that failed every time ran, and billed, on every push).
+  `if: always()`) records it as a round with `complete: false` and `model_call: true`, so it counts against the cap;
+  the summary says `**Review failed:**` with the reason, the open findings stay open, and the step still fails. A
+  failed run that cost nothing records nothing (a Claude review finding on a copy of this script: such runs were never
+  recorded, so a review that failed every time ran, and billed, on every push).
 
 **The run.** `review` also gets `--state`, `--interdiff-dir`, `--diff-source`, `--mode`, `--round` and `GH_TOKEN`: it
 fetches the PR title and body (`gh api`) and `review_prompt` puts them in a fenced block headed "PR description" (data,
@@ -221,17 +225,28 @@ The outcome is read from the replies in the finding's review thread, so answer e
 - no such reply: `resolved` / `open`, recorded as tentative evidence only. A summary-only finding has no thread and
   stays `unknown`.
 
-## Cost record
+## Run record
 
-After every review, `claude_review.py cost` reads the `claude -p` JSON result and reports `total_cost_usd`,
-input/output/cache tokens, turns and duration **as the CLI reported them**. It writes a table to the job summary and
-uploads `claude-review-cost.json` as the artifact `claude-review-cost-pr<NN>-run<id>-<attempt>` (90 days). A missing
-record fails the step instead of reporting a zero. A run that ended early (`subtype` other than `success`, e.g.
-`error_max_turns`, or `is_error`) is marked as such with a workflow warning, and the error text of a failed run is
-printed: its cost is real, its review incomplete.
+After every review, `claude_review.py outcome` reads the `claude -p` JSON result and reports how the run ended: its
+status, tier, model, turns and duration **as the CLI reported them**. It writes a table to the job summary and uploads
+`claude-review-cost.json` as the artifact `claude-review-cost-pr<NN>-run<id>-<attempt>` (90 days; file and artifact
+keep their v1 names, README.md "Contract with the session retro"). A missing record fails the step instead of
+reporting a zero. A run that ended early (`subtype` other than `success`, e.g. `error_max_turns`, or `is_error`) is
+marked as such with a workflow warning, and the error text of a failed run is printed: its review is incomplete.
 
-To compare tiers, collect the artifacts of several runs, e.g.
-`gh run download <run-id> --repo <caller> -n claude-review-cost-pr<NN>-run<run-id>-1`.
+**No output of a run shows its API cost** (the owner's decision of 2026-11-05). For a public repository the comments
+with their state block, the log and job summary of a run and its artifacts are all public, so none of them carries the
+cost or the token counts, which give the cost at the public prices: the summary comment has no cost column and gives
+the turns only, the state block keeps `model_call` instead of the amount ("Rounds"), the run record has no cost or
+token fields, and the findings record keeps its key `cost_usd` (schema 2 only adds fields), always empty. A run reads
+the cost of its own result only to decide `model_call`. The cost of the reviews is in the Anthropic Console, under the
+workspace of the calling repository's API key. The budget caps (`max_budget_usd`) stay in each caller's config: they
+are limits, not spending. Outputs written before v1.3.0 keep their amounts: earlier revisions of summary comments, and
+logs, job summaries and artifacts within their retention.
+
+To compare tiers, collect the run records of several runs, e.g.
+`gh run download <run-id> --repo <caller> -n claude-review-cost-pr<NN>-run<run-id>-1`, and set them against the cost
+in the Console.
 
 ## Rules for maintainers
 
@@ -250,3 +265,6 @@ To compare tiers, collect the artifacts of several runs, e.g.
   separate decision of each repository.
 - Bump the pinned CLI version (`CLAUDE_CODE_VERSION` in the workflow) deliberately.
 - Keep the model read-only: posting belongs in `post`, not in the model's tools.
+- Never write the API cost or a token count into an output of a run (comment, state block, log, job summary,
+  artifact; "Run record"): every one is public for a public repository. A test feeds a result with a cost through
+  `outcome` and `post` and fails on any amount it finds.

@@ -6,8 +6,8 @@
 # never silent. See docs/codebase/notes/claude-pr-review.md.
 #
 # ASSUMPTION: all thresholds below are starting values, not measured; each block names
-# the date its values were chosen. Re-tune them from the per-run cost records in the job
-# summaries.
+# the date its values were chosen. Re-tune them from the run records in the job summaries
+# (status, turns) and the reviews' cost in the Anthropic Console (no review output shows it).
 
 labels:
   force: claude-review        # adding it starts ONE deep-tier review; later pushes are gated normally
@@ -88,7 +88,7 @@ skip_kinds:
 #   full  - a critical path touched, or >= full_min_lines lines, or >= full_min_files files
 #   light - every other change with at least one counted line or file
 # ASSUMPTION: starting values chosen on 2026-11-02 (the full thresholds are the former light
-# ones), re-tune them from the cost records.
+# ones), re-tune them from the run records and the cost in the Console.
 thresholds:
   deep_min_structure_files: 5   # changed structure files for the deep tier
   deep_min_structure_lines: 300 # changed lines in structure files for the deep tier
@@ -107,14 +107,14 @@ thresholds:
 # rounds only a push with open findings is still checked, by at most verify_after_cap (optional,
 # default 2) verify rounds on verify_tier; adding the force label reads the whole PR again and
 # does not count.
-# ASSUMPTION: starting values chosen on 2026-10-28, re-tune from the cost records.
+# ASSUMPTION: starting values chosen on 2026-10-28, re-tune from the run records and the cost in the Console.
 rereview:
   max_rounds: 3
   verify_tier: light
 
 # max_budget_usd is a hard per-run cap (claude -p --max-budget-usd): 10 / 50 / 50 USD, the
 # owner's choice (2026-10-30 for light and full, 2026-11-02 for deep); the turn limits are an
-# ASSUMPTION (the budget is the binding limit), re-tune them from the cost records.
+# ASSUMPTION (the budget is the binding limit), re-tune them from the run records and the cost in the Console.
 tiers:
   light:
     model: claude-sonnet-5-5
