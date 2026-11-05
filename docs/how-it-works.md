@@ -91,8 +91,10 @@ Why the review works in rounds: ADR-0171 in TUBS-IVS/eqasim-bs.
 rounds on the same commit, e.g. a forced round after the cap, never share an id; `path`, `line`, `severity`,
 `scope`, `title`, `comment_id`, `status`, and for open ones `body` and `author_note`; caps `TITLE_CHARS`,
 `BODY_CHARS`, `NOTE_CHARS`). `status` is `open`, `resolved` (a later round verified the fix) or `dismissed`
-(`refresh_state`: a thread reply starting with `REJECTED_PREFIXES`, or a thread resolved by a human; the bot's own
-`Re-review at ...` reply never dismisses, and only `open` findings change status). Only `open` findings go to the
+(`refresh_state`: a thread reply starting with `REJECTED_PREFIXES`, or a thread resolved by a human without a fix
+claim; a reply starting with `FIXED_PREFIXES` keeps the finding `open` also in a resolved thread, so the next round
+checks the fix; the bot's own `Re-review at ...` reply never dismisses, and only `open` findings change status). Only
+`open` findings go to the
 model. `post` re-reads the comment and merges rounds and findings (`merge_state`) before writing, so a run for a
 commit that is no longer the head still records its findings but leaves the visible summary text alone; its round is
 marked `stale` and never becomes the last reviewed commit. Threads of resolved findings are closed only after the state
@@ -108,7 +110,11 @@ reverted paths; a renamed file is changed). `last` is the last round with `compl
 **Decision order of a further round** (a state with a complete round, a push-like event): skip label, other label
 events and drafts as in the first round; then `rereview.max_rounds` automatic rounds that called the model
 (`automatic_rounds`: complete or not, cost above zero; `complete` only moves the reviewed commit) reached -> none
-(`round cap`); nothing changed -> none, unless findings are open and a file was reverted to the base branch (a revert
+(`round cap`), except that a push with open findings and a usable interdiff still gets up to
+`rereview.verify_after_cap` (optional, default `VERIFY_AFTER_CAP` = 2) more rounds on `rereview.verify_tier`, which
+check the fixes in the interdiff and are never a re-review of the push (the owner's decision of 2026-11-05: a fix
+pushed after the last round is still checked; a merge of the base branch alone gets none, a revert gets one without a
+diff); before the cap: nothing changed -> none, unless findings are open and a file was reverted to the base branch (a revert
 can fix a finding, a merge of the base branch cannot) -> `rereview.verify_tier` with no diff (the model verifies at
 head); otherwise the tier of the interdiff numstat with the normal thresholds, critical and structure paths, raised to
 `rereview.verify_tier` when that is none (e.g. a `docs/` branch without a critical path) but findings are open; a push

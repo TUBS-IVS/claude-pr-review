@@ -3,6 +3,17 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
+## v1.2.0 (unreleased)
+
+- A fix pushed after the last automatic round is still checked. Past `rereview.max_rounds`, a push with open
+  findings gets up to `rereview.verify_after_cap` more rounds (new optional key, default 2) on
+  `rereview.verify_tier`; they check the fixes in the changes since the last complete round and never re-review the
+  push. A merge of the base branch alone gets none, a revert gets one without a diff, a rebase none. Before, the cap
+  stopped every run, so the fix of a last-round finding was never verified. `verify_after_cap: 0` restores that.
+- A reply starting with "Fixed" keeps its finding open for that check also when its thread was resolved; before,
+  any resolved thread dismissed the finding unverified. A resolved thread without a fix claim still dismisses it.
+- The summary says what a push after the cap still gets.
+
 ## v1.1.0 (2026-11-04)
 
 - New optional config key `tiers.<tier>.effort` (`low`, `medium`, `high`, `xhigh` or `max`): the review runs

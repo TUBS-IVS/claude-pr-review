@@ -527,6 +527,28 @@ def test_refresh_state_dismisses_what_the_author_closed_and_keeps_the_bot_resolu
     assert [f["id"] for f in cr.open_findings(out)] == ["s-3"]
 
 
+def test_refresh_state_keeps_a_fix_open_for_verification_even_when_its_thread_was_resolved():
+    """A session that answers "Fixed ..." and resolves its own thread must not skip the check of the fix:
+    only an answer without a fix claim (or a rejection) closes a finding unverified (2026-11-05)."""
+    state = cr.empty_state()
+    state["findings"] = [{"id": "s-6", "path": "a.py", "line": 6, "severity": "medium", "scope": "introduced",
+                          "title": "t6", "body": "b", "author_note": "", "comment_id": 6, "status": "open"}]
+    threads = {6: {"thread_id": "T6", "resolved": True, "replies": ["Fixed in 4ef961dc: the key is normalised"]}}
+    out = cr.refresh_state(state, threads)
+    assert out["findings"][0]["status"] == "open"
+    assert out["findings"][0]["author_note"] == "Fixed in 4ef961dc: the key is normalised"
+
+
+@pytest.mark.parametrize("verify_left, expected", [
+    (2, "a later push with open findings only gets a short check of its fixes (at most 2 more rounds)"),
+    (0, "later pushes are not reviewed"),
+])
+def test_the_summary_says_what_happens_after_the_round_cap(verify_left, expected):
+    body = cr.summary_markdown({"summary": "s", "findings": []}, [], [], "light", "c" * 40, "Cost 0.1 USD.",
+                               cap_reached=True, verify_left=verify_left)
+    assert expected in body and "Add the label `claude-review` for another review of the whole PR." in body
+
+
 def test_state_cli_reads_the_summary_and_logs_the_fallback_for_a_summary_without_a_block(tmp_path, monkeypatch, capsys):
     bodies = {"101": "## Claude review (full tier, commit 1234)\n\nold-format summary\n" + cr.SUMMARY_MARKER}
 
@@ -691,8 +713,16 @@ def _ctx(auto=1, open_=0, changed=None, fallback="", reverted=(), events=()):
 
 
 @pytest.mark.parametrize("entries, branch, action, label, ctx, tier, mode, diff", [
-    # cap reached -> nothing, whatever the push
-    ([("braunschweig/x.py", 900)], "fix/i1-x", "synchronize", "", _ctx(auto=3, open_=2, changed=[("braunschweig/x.py", 900)]), "none", "none", "none"),
+    # cap reached -> a push with open findings still gets a verify round, so a fix after the last round is
+    # checked (owner's decision of 2026-11-05); never a re-review of the push itself, whatever its size
+    ([("braunschweig/x.py", 900)], "fix/i1-x", "synchronize", "", _ctx(auto=3, open_=2, changed=[("braunschweig/x.py", 900)]), "light", "verify", "interdiff"),
+    # ... nothing open -> nothing
+    ([("braunschweig/x.py", 900)], "fix/i1-x", "synchronize", "", _ctx(auto=3, open_=0, changed=[("braunschweig/x.py", 900)]), "none", "none", "none"),
+    # ... the verify rounds after the cap used up too (3 + 2) -> nothing
+    ([("braunschweig/x.py", 900)], "fix/i1-x", "synchronize", "", _ctx(auto=5, open_=2, changed=[("braunschweig/x.py", 900)]), "none", "none", "none"),
+    # ... a merge of main alone cannot fix a finding -> nothing; a revert can -> verify without a diff
+    ([("braunschweig/x.py", 900)], "fix/i1-x", "synchronize", "", _ctx(auto=3, open_=1, changed=[]), "none", "none", "none"),
+    ([("braunschweig/x.py", 900)], "fix/i1-x", "synchronize", "", _ctx(auto=4, open_=1, changed=[], reverted=["braunschweig/z.py"]), "light", "verify", "none"),
     # nothing changed against main (a merge of main only) and nothing open -> nothing
     ([("braunschweig/x.py", 400)], "fix/i1-x", "synchronize", "", _ctx(changed=[]), "none", "none", "none"),
     # nothing changed but open findings (a revert as the fix) -> verify tier without a diff
@@ -731,6 +761,30 @@ def test_classify_gates_further_rounds_from_the_committed_config(entries, branch
         assert decision.model == CONFIG["tiers"][CONFIG["rereview"]["verify_tier"]]["model"]
     if ctx.fallback:
         assert decision.reason.startswith("fallback:")
+
+
+def test_verify_rounds_after_the_cap_are_configurable_and_zero_keeps_the_hard_stop():
+    push = dict(entries=[("braunschweig/x.py", 900)], branch="fix/i1-x", labels=[], draft=False,
+                event_action="synchronize", event_label="")
+    config = copy.deepcopy(CONFIG)
+    config["rereview"]["verify_after_cap"] = 0
+    decision = cr.classify(config, context=_ctx(auto=3, open_=2, changed=[("braunschweig/x.py", 9)]), **push)
+    assert decision.tier == "none" and "round cap" in decision.reason
+    config["rereview"]["verify_after_cap"] = 1
+    decision = cr.classify(config, context=_ctx(auto=3, open_=2, changed=[("braunschweig/x.py", 9)]), **push)
+    assert (decision.tier, decision.mode) == ("light", "verify") and "after the round cap" in decision.reason
+    decision = cr.classify(config, context=_ctx(auto=4, open_=2, changed=[("braunschweig/x.py", 9)]), **push)
+    assert decision.tier == "none"
+
+
+def test_verify_after_cap_is_optional_in_a_callers_config():
+    """Callers' configs from before the key existed stay valid; a set value passes too."""
+    assert "verify_after_cap" not in CONFIG["rereview"] and cr.config_problems(CONFIG, _PROMPT) == []
+    config = copy.deepcopy(CONFIG)
+    config["rereview"]["verify_after_cap"] = 1
+    assert cr.config_problems(config, _PROMPT) == []
+    config["rereview"]["verify_after_kap"] = 1
+    assert any("unknown key 'rereview.verify_after_kap'" in p for p in cr.config_problems(config, _PROMPT))
 
 
 def test_classify_without_a_context_is_the_first_round():
@@ -1133,6 +1187,8 @@ _PROMPT = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8"
     (lambda c: c.update(critcal_paths=["x/**"]), "unknown key 'critcal_paths'"),
     (lambda c: c["rereview"].update(verify_tier="medium"), "'rereview.verify_tier' must be one of light, full, deep"),
     (lambda c: c["rereview"].update(max_rounds=0), "'rereview.max_rounds' must be a whole number >= 1"),
+    (lambda c: c["rereview"].update(verify_after_cap=-1), "'rereview.verify_after_cap' must be a whole number >= 0"),
+    (lambda c: c["rereview"].update(verify_after_cap="2"), "'rereview.verify_after_cap' must be a whole number >= 0"),
     (lambda c: c["labels"].update(skip=c["labels"]["force"]), "must be different labels"),
     (lambda c: c["labels"].update(force=" "), "'labels.force' must be a label name"),
     (lambda c: c["thresholds"].pop("full_min_files"), "'thresholds.full_min_files' is missing"),

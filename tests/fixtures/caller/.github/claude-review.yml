@@ -104,7 +104,9 @@ thresholds:
 # would not review (a docs/ branch without a critical path) still gets verify_tier while
 # findings of earlier rounds are open, so a fix is checked; a push of ignored files alone gets
 # no run, like a merge of the base branch: it cannot fix a finding. After max_rounds automatic
-# rounds the review stops; adding the force label reads the whole PR again and does not count.
+# rounds only a push with open findings is still checked, by at most verify_after_cap (optional,
+# default 2) verify rounds on verify_tier; adding the force label reads the whole PR again and
+# does not count.
 # ASSUMPTION: starting values chosen on 2026-10-28, re-tune from the cost records.
 rereview:
   max_rounds: 3
