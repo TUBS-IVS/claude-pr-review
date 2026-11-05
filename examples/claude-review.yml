@@ -6,8 +6,9 @@ name: Claude PR review
 # The gate config .github/claude-review.yml and the prompt .github/claude-review-prompt.md are this
 # repository's own. Keep this file's name: the maintainer's session retro lists review runs by it.
 #
-# Prerequisite: repository secret ANTHROPIC_API_KEY (a key of a workspace of the Console
-# organization). Only this secret is handed to the central workflow.
+# Prerequisites: the secret ANTHROPIC_API_KEY (a key of a workspace of the Console organization)
+# and the organization secret CLAUDE_REVIEW_BUDGETS (each tier's hard budget per run, not published).
+# Only these two secrets are handed to the central workflow.
 
 on:
   pull_request:
@@ -38,3 +39,4 @@ jobs:
     uses: TUBS-IVS/claude-pr-review/.github/workflows/review.yml@v1
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_REVIEW_BUDGETS: ${{ secrets.CLAUDE_REVIEW_BUDGETS }}

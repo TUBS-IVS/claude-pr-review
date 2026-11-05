@@ -35,6 +35,12 @@ on:
       ANTHROPIC_API_KEY:
         description: API key of a workspace of the Console organization (an organization-level key fails).
         required: true
+      CLAUDE_REVIEW_BUDGETS:
+        description: >-
+          The hard budget per run of each tier in USD, as JSON ({"light": <usd>, "full": <usd>, "deep": <usd>}),
+          from an organization secret, so that no budget is published. Optional for callers that do not pass it
+          yet: check-config then takes the deprecated max_budget_usd of their config and warns.
+        required: false
 
 permissions:
   contents: read
@@ -92,6 +98,8 @@ jobs:
         id: gate
         env:
           CONFIG: ${{ inputs.config }}
+          # check-config validates the budgets; nothing prints them.
+          CLAUDE_REVIEW_BUDGETS: ${{ secrets.CLAUDE_REVIEW_BUDGETS }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -209,6 +217,8 @@ jobs:
       - name: Claude review (read-only, structured findings)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The tier's budget binds the run (--max-budget-usd); the model's own process does not get it.
+          CLAUDE_REVIEW_BUDGETS: ${{ secrets.CLAUDE_REVIEW_BUDGETS }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python "$TOOL" review --config "$CONFIG" \

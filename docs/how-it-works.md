@@ -7,8 +7,9 @@ replaces the calling repository's own tests. How a repository adopts it, and how
 [README.md](../README.md). Why it is one central repository: ADR-0176 in TUBS-IVS/eqasim-bs. Numbers such as
 "PR #497" below refer to TUBS-IVS/eqasim-bs, where the review began.
 
-Prerequisite: the calling repository's secret `ANTHROPIC_API_KEY`, a key of a **workspace** of the Console
-organization (an organization-level key fails with "not scoped to a workspace"). Comments are posted with the
+Prerequisites: the calling repository's secret `ANTHROPIC_API_KEY`, a key of a **workspace** of the Console
+organization (an organization-level key fails with "not scoped to a workspace"), and the organization secret
+`CLAUDE_REVIEW_BUDGETS` with each tier's hard budget per run ("The gate", below). Comments are posted with the
 workflow's `GITHUB_TOKEN` (as `github-actions[bot]`). PRs from forks and from Dependabot get no Actions secrets
 and are skipped with a note in the job summary.
 
@@ -41,14 +42,24 @@ above then no longer apply.
 **`check-config` comes first.** It validates the calling repository's config and the prompt it names
 (`config_problems`) and fails the gate job, before anything is spent, with one `::error::` line per problem: a key the
 code does not know (a misspelt key would otherwise silently disable its rule), a missing section or key, a tier of
-`TIER_NAMES` that is missing or has no model, a turn limit below 1, a budget outside `0 < max_budget_usd <=
-MAX_BUDGET_USD` (50 USD, the owner's per-run cap, ADR-0175), a tool beyond `READ_ONLY_TOOLS`, a `verify_tier` that is
-no tier, equal force and skip labels, or a prompt with an unknown placeholder, without `{{DIFF_BLOCK}}` or
-`{{ROUND_BLOCK}}`, or with `{{PR_BODY}}` outside two `{{FENCE}}` lines. Fork and Dependabot PRs are skipped before it.
+`TIER_NAMES` that is missing or has no model, a turn limit below 1, a tier without a budget, a tool beyond
+`READ_ONLY_TOOLS`, a `verify_tier` that is no tier, equal force and skip labels, or a prompt with an unknown
+placeholder, without `{{DIFF_BLOCK}}` or `{{ROUND_BLOCK}}`, or with `{{PR_BODY}}` outside two `{{FENCE}}` lines. Fork
+and Dependabot PRs are skipped before it.
 
-The thresholds, paths, labels, models, turn and budget limits live in the calling repository's
-`.github/claude-review.yml`, not in code. Re-tune them from the run records below and the cost in the Anthropic
-Console ("Run record"). Decision order (`classify`; the
+**The budgets** (each tier's hard cap per run, `claude -p --max-budget-usd`) come from the organization secret
+`CLAUDE_REVIEW_BUDGETS` (`BUDGETS_ENV`), which the caller passes: a JSON object with a finite number above 0 for every
+tier, `{"light": <usd>, "full": <usd>, "deep": <usd>}`. They are the owner's and are not published (the owner's
+decision of 2026-11-05; ADR-0181 in TUBS-IVS/eqasim-bs), so no config holds them, no output names them, and the
+gate and the review step are the only steps that get the secret; the model's own process does not. `check-config`
+fails on a secret that is not such an object, lacks a tier or holds anything but a positive number for one, and on a
+`max_budget_usd` left in the config while the secret is set; its messages never quote a value. A caller that does
+not pass the secret yet still runs on the deprecated `max_budget_usd` of its config (above 0), with a
+`::warning::` on every run; a tier with neither is a failure, so no run is unbounded.
+
+The thresholds, paths, labels, models and turn limits live in the calling repository's `.github/claude-review.yml`,
+not in code. Re-tune them from the run records below and the cost in the Anthropic Console ("Run record"). Decision
+order (`classify`; the
 first-round order, a PR without a complete round on record, is below, the further-round order is in "Rounds"):
 
 1. Label `labels.skip` -> no review.
@@ -174,7 +185,8 @@ the free `classify` job; suppressing them in the caller would copy the label nam
 - `review` fills the placeholders of the prompt file (`review.prompt_file`) and runs `claude -p` with the tier's
   `model`, its `effort` when the config sets one (`--effort`; otherwise the model's default: medium on Opus 5.5 and
   Sonnet 5.5, high on Fable 5.1, per the Claude Code docs "Model configuration"; the log line of the run names it),
-  `max_turns` and `max_budget_usd` (a hard cap per run), the JSON schema `FINDINGS_SCHEMA`, `--bare`
+  `max_turns`, the tier's budget (`tier_budget`: from the secret, "The gate"; a hard cap per run, never printed: the
+  log line names only its source), the JSON schema `FINDINGS_SCHEMA`, `--bare`
   (authentication strictly by `ANTHROPIC_API_KEY`, never a Claude plan login; no user hooks, plugins, memory or
   automatic CLAUDE.md loading; the prompt names the rule files to read), `--permission-mode dontAsk` and only the read
   tools of `review.allowed_tools` (Read, Grep, Glob). The model has no shell, cannot write files and cannot post
@@ -239,10 +251,12 @@ with their state block, the log and job summary of a run and its artifacts are a
 cost or the token counts, which give the cost at the public prices: the summary comment has no cost column and gives
 the turns only, the state block keeps `model_call` instead of the amount ("Rounds"), the run record has no cost or
 token fields, and the findings record keeps its key `cost_usd` (schema 2 only adds fields), always empty. A run reads
-the cost of its own result only to decide `model_call`. The cost of the reviews is in the Anthropic Console, under the
-workspace of the calling repository's API key. The budget caps (`max_budget_usd`) stay in each caller's config: they
-are limits, not spending. Outputs written before v1.3.0 keep their amounts: earlier revisions of summary comments, and
-logs, job summaries and artifacts within their retention.
+the cost of its own result only to decide `model_call`. The budgets per run are not published either (they come from
+a secret, "The gate"), and a text of the CLI that the review publishes (the error of a failed run, the CLI's own
+warnings in the log) has every money amount replaced by `[amount]` (`redact_amounts`): a run cut off by its budget
+may name it. The cost of the reviews is in the Anthropic Console, under the workspace of the calling repository's
+API key. Outputs written before v1.3.0 keep their amounts: earlier revisions of summary comments, and logs, job
+summaries and artifacts within their retention.
 
 To compare tiers, collect the run records of several runs, e.g.
 `gh run download <run-id> --repo <caller> -n claude-review-cost-pr<NN>-run<run-id>-1`, and set them against the cost
@@ -257,14 +271,15 @@ in the Console.
   added, never renamed or removed), the state marker, and the outcome words. A bot reply never starts with "Fixed",
   "Rejected" or "Not changed"; the verification reply starts with `Re-review at <sha12>:`. The state block never
   contains `-->`.
-- Thresholds, paths, labels, models, limits and tools belong in each calling repository's config, never in code or in
-  the workflow; the label names must not appear in either workflow (a test checks this).
+- Thresholds, paths, labels, models, turn limits and tools belong in each calling repository's config, never in code
+  or in the workflow; the label names must not appear in either workflow (a test checks this). The budgets belong in
+  the organization secret only, never in a config, the code, the docs or an output.
 - A new config key needs `CONFIG_KEYS` (or `check-config` rejects it as unknown), a default that keeps old configs
   valid, a test, and a line in CHANGELOG.md; a key that old configs must add is a new major version.
 - Keep the review advisory until its findings have been checked against real PRs; making it a required check is a
   separate decision of each repository.
 - Bump the pinned CLI version (`CLAUDE_CODE_VERSION` in the workflow) deliberately.
 - Keep the model read-only: posting belongs in `post`, not in the model's tools.
-- Never write the API cost or a token count into an output of a run (comment, state block, log, job summary,
-  artifact; "Run record"): every one is public for a public repository. A test feeds a result with a cost through
-  `outcome` and `post` and fails on any amount it finds.
+- Never write the API cost, a token count or a budget into an output of a run (comment, state block, log, job
+  summary, artifact; "Run record"): every one is public for a public repository. Tests feed a result with a cost and
+  budgets through `check-config`, `review`, `outcome` and `post` and fail on any amount they find.

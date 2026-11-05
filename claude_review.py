@@ -60,6 +60,7 @@ import argparse
 import copy
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -513,8 +514,11 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
 # and prompt; these checks are the part every one of them must meet (ADR-0176 in TUBS-IVS/eqasim-bs).
 #: The tiers classify can pick; a config must define each of them, or a run ends in a KeyError.
 TIER_NAMES = ("light", "full", "deep")
-#: The owner's hard cap per review run in USD (ADR-0175 in TUBS-IVS/eqasim-bs): no tier may allow more.
-MAX_BUDGET_USD = 50.0
+#: The secret, passed by the caller, that holds each tier's hard budget per run in USD as JSON
+#: ({"light": <usd>, "full": <usd>, "deep": <usd>}). The budgets are the owner's and are not published
+#: (the owner's decision of 2026-11-05), so they live in an organization secret, not in the public
+#: config. Without the secret the config's deprecated `max_budget_usd` still bounds the run, with a warning.
+BUDGETS_ENV = "CLAUDE_REVIEW_BUDGETS"
 #: The model only reads; posting is done by `post`, never by the model, and it gets no shell.
 READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
 THRESHOLD_KEYS = ("deep_min_structure_files", "deep_min_structure_lines", "deep_min_lines", "deep_min_files",
@@ -541,18 +545,66 @@ def _whole(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _positive(value) -> bool:
+    """A finite number above 0 (JSON's Infinity would make a run unbounded)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
+def _budget_secret_problems(secret: str) -> list:
+    """What is wrong with the budgets secret; [] when nothing is. The problems are printed, so they
+    never quote a value of the secret."""
+    try:
+        budgets = json.loads(secret)
+    except json.JSONDecodeError:
+        budgets = None
+    if not isinstance(budgets, dict):
+        return [f"the secret {BUDGETS_ENV} must be a JSON object of tier names and budgets in USD"]
+    problems = [f"the secret {BUDGETS_ENV} has no budget for the tier '{name}'" for name in TIER_NAMES
+                if name not in budgets]
+    problems += [f"the secret {BUDGETS_ENV} names an unknown tier '{name}' (known: {', '.join(TIER_NAMES)})"
+                 for name in sorted(set(budgets) - set(TIER_NAMES))]
+    problems += [f"the budget of the tier '{name}' in the secret {BUDGETS_ENV} must be a number above 0"
+                 for name in TIER_NAMES if name in budgets and not _positive(budgets[name])]
+    return problems
+
+
+def tier_budget(tier_cfg: dict, tier: str, budgets: str) -> tuple:
+    """(USD, source) of the hard budget of one run of ``tier``: from the secret (``budgets``, its
+    text) when the caller passes it, else from the config's deprecated, public ``max_budget_usd``.
+    check-config has validated whichever applies. The amount is never printed."""
+    if budgets.strip():
+        return float(json.loads(budgets)[tier]), f"the secret {BUDGETS_ENV}"
+    return float(tier_cfg["max_budget_usd"]), f"the config (public; pass the secret {BUDGETS_ENV} instead)"
+
+
+#: A money amount in a text from the CLI: "$1,234.50", "7 USD", "USD 3". A run cut off by its budget
+#: may name the budget, and that text is published (log, job summary, summary comment).
+_AMOUNT = re.compile(r"\$\s?\d(?:[\d,]*\d)?(?:\.\d+)?|\b\d(?:[\d,]*\d)?(?:\.\d+)?\s?(?:USD|dollars?)\b"
+                     r"|\bUSD\s?\d(?:[\d,]*\d)?(?:\.\d+)?", re.IGNORECASE)
+
+
+def redact_amounts(text: str) -> str:
+    """``text`` with every money amount replaced by "[amount]"."""
+    return _AMOUNT.sub("[amount]", text)
+
+
 def _mapping(config: dict, key: str) -> dict:
     value = config.get(key)
     return value if isinstance(value, dict) else {}
 
 
-def config_problems(config, prompt_template) -> list:
+def config_problems(config, prompt_template, budgets: str = "") -> list:
     """Every reason why a gate config and its prompt would make a broken or unbounded review run;
     [] when there is none. ``prompt_template`` is the text of ``review.prompt_file``, or None when
-    that file cannot be read."""
+    that file cannot be read; ``budgets`` is the text of the secret CLAUDE_REVIEW_BUDGETS ("" when the
+    caller does not pass it). Every tier needs a budget from exactly one source: the secret, or,
+    deprecated, the config's public ``max_budget_usd``."""
     if not isinstance(config, dict):
         return ["the config is not a mapping of keys"]
+    secret = budgets.strip()
     problems = [f"unknown key '{key}' (known: {', '.join(CONFIG_KEYS)})" for key in sorted(set(config) - set(CONFIG_KEYS))]
+    if secret:
+        problems += _budget_secret_problems(secret)
     for section, keys in CONFIG_KEYS.items():
         if keys is None:
             continue
@@ -592,10 +644,13 @@ def config_problems(config, prompt_template) -> list:
             problems.append(f"'tiers.{name}.model' must be a model id")
         if not (_whole(tier.get("max_turns")) and tier["max_turns"] >= 1):
             problems.append(f"'tiers.{name}.max_turns' must be a whole number >= 1, got {tier.get('max_turns')!r}")
-        budget = tier.get("max_budget_usd")
-        if not (isinstance(budget, (int, float)) and not isinstance(budget, bool) and 0 < budget <= MAX_BUDGET_USD):
-            problems.append(f"'tiers.{name}.max_budget_usd' must be above 0 and at most {MAX_BUDGET_USD:g} USD "
-                            f"(the per-run cap), got {budget!r}")
+        if secret and "max_budget_usd" in tier:
+            problems.append(f"'tiers.{name}.max_budget_usd' must go: the secret {BUDGETS_ENV} holds the budgets, "
+                            "and the config is public")
+        elif not secret and not _positive(tier.get("max_budget_usd")):
+            # No value is quoted: a budget is not published.
+            problems.append(f"'tiers.{name}' has no budget: pass the secret {BUDGETS_ENV} (or, deprecated and "
+                            f"public, set 'tiers.{name}.max_budget_usd' to a number above 0)")
         if "effort" in tier and tier["effort"] not in EFFORT_LEVELS:
             # The CLI only warns on an unknown level and runs at the default, so a typo would silently
             # undo the chosen effort; reject it here instead.
@@ -662,7 +717,7 @@ def run_outcome(result: dict) -> dict:
         "subtype": str(result.get("subtype", "unknown")),
         # On a failed run the result text carries the error (e.g. the API's message), which the
         # action itself hides in its log; keep it so the failure is diagnosable.
-        "error_text": str(result.get("result", ""))[:1000] if result.get("is_error") else "",
+        "error_text": redact_amounts(str(result.get("result", "")))[:1000] if result.get("is_error") else "",
     }
 
 
@@ -754,7 +809,8 @@ def review_prompt(template: str, repo: str, pr: int, tier: str, sha: str, diff_s
     return build_prompt(template, values, verbatim)
 
 
-def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list) -> list:
+def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_usd: float) -> list:
+    """The `claude -p` call of one review run; ``budget_usd`` is the tier's hard budget (tier_budget)."""
     # The tier's effort level, when the config sets one (check-config has validated it); without
     # it the CLI applies the model's default.
     effort = ["--effort", str(tier_cfg["effort"])] if tier_cfg.get("effort") else []
@@ -766,7 +822,7 @@ def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list) -> list
         "--model", str(tier_cfg["model"]),
         *effort,
         "--max-turns", str(int(tier_cfg["max_turns"])),
-        "--max-budget-usd", str(float(tier_cfg["max_budget_usd"])),
+        "--max-budget-usd", str(float(budget_usd)),
         "--output-format", "json",
         "--json-schema", json.dumps(FINDINGS_SCHEMA),
         # dontAsk denies every tool that is not pre-allowed; there is nobody to ask in CI.
@@ -838,7 +894,8 @@ def number_diff(diff_text: str) -> str:
 def read_findings(result: dict) -> dict:
     """Return the structured findings of a `claude -p --json-schema` result."""
     if result.get("is_error"):
-        raise ValueError(f"the review run failed: {' '.join(str(result.get('result', '')).split())[:500]}")
+        text = redact_amounts(" ".join(str(result.get("result", "")).split()))
+        raise ValueError(f"the review run failed: {text[:500]}")
     structured = result.get("structured_output")
     if structured is None:
         # Older CLI versions return the JSON only as the result text.
@@ -1193,6 +1250,7 @@ def _cmd_check_config(args) -> int:
     """Validate the calling repository's gate config and prompt; no model, no cost."""
     import yaml
 
+    budgets = os.environ.get(BUDGETS_ENV, "")
     try:
         config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as error:
@@ -1203,7 +1261,7 @@ def _cmd_check_config(args) -> int:
             template = Path(prompt_file).read_text(encoding="utf-8") if prompt_file else None
         except OSError:
             template = None
-        problems = config_problems(config, template)
+        problems = config_problems(config, template, budgets=budgets)
     for problem in problems:
         print(f"::error::[claude-review] {args.config}: {problem}")
     if problems:
@@ -1211,8 +1269,13 @@ def _cmd_check_config(args) -> int:
                                        "no review runs until it is fixed:\n"
                                        + "".join(f"  - {problem}\n" for problem in problems))
         return 1
+    if not budgets.strip():
+        # The deprecated source: it still bounds every run, but its amounts are public.
+        print(f"::warning::[claude-review] {args.config}: the budgets per run come from the public config; pass the "
+              f"secret {BUDGETS_ENV} and remove max_budget_usd (TUBS-IVS/claude-pr-review, README.md)")
+    source = f"the secret {BUDGETS_ENV}" if budgets.strip() else "the config"
     print(f"[claude-review] config {args.config} and prompt {prompt_file}: OK (tiers {', '.join(TIER_NAMES)}, "
-          f"budget <= {MAX_BUDGET_USD:g} USD per run, tools {', '.join(config['review']['allowed_tools'])})")
+          f"budgets from {source}, tools {', '.join(config['review']['allowed_tools'])})")
     return 0
 
 
@@ -1417,15 +1480,19 @@ def _cmd_review(args) -> int:
         # claude --bare authenticates only with this key; fail here with a clear message instead.
         print("::error::ANTHROPIC_API_KEY is not set; the review needs a workspace API key.")
         return 1
-    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"])
+    budget, source = tier_budget(tier_cfg, args.tier, os.environ.get(BUDGETS_ENV, ""))
+    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"], budget)
     print(f"[claude-review] running claude -p: tier {args.tier}, model {tier_cfg['model']}, "
           f"effort {tier_cfg.get('effort') or 'model default'}, max {tier_cfg['max_turns']} turns, "
-          f"budget {tier_cfg['max_budget_usd']} USD")
+          f"budget from {source}")
+    # The model's process gets no budgets: the model reads files, and what it writes is posted publicly.
+    child_env = {key: value for key, value in os.environ.items() if key != BUDGETS_ENV}
     # The prompt goes in on stdin: no argv length limit, and it is not echoed in process listings.
-    completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8")
+    completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                               env=child_env)
     Path(args.out).write_text(completed.stdout, encoding="utf-8")
     if completed.stderr.strip():
-        print(completed.stderr.strip()[-2000:], file=sys.stderr)
+        print(redact_amounts(completed.stderr.strip()[-2000:]), file=sys.stderr)
     print(f"[claude-review] claude exited with {completed.returncode}; result written to {args.out}")
     return completed.returncode
 

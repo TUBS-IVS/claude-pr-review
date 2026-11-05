@@ -37,6 +37,10 @@ def _load():
 
 cr = _load()
 CONFIG = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))
+# The budgets per run as the organization secret CLAUDE_REVIEW_BUDGETS holds them (made-up, distinct
+# amounts, so a hit in an output is never a coincidence); the fixture config, like every caller's, has none.
+_BUDGETS = json.dumps({"light": 3.5, "full": 7.25, "deep": 9.75})
+_BUDGET_AMOUNTS = ("3.5", "7.25", "9.75")
 
 
 _ADDED_STAGE = [("A", "synthesis/population/new_stage.py")]
@@ -429,7 +433,7 @@ def test_the_fixture_prompt_and_tiers_give_a_bounded_read_only_run():
     # (the check-config tests at the end); here the code itself is checked on the fixture.
     review_cfg = CONFIG["review"]
     template = (_CALLER / review_cfg["prompt_file"]).read_text(encoding="utf-8")
-    assert cr.config_problems(CONFIG, template) == []
+    assert cr.config_problems(CONFIG, template, budgets=_BUDGETS) == []
     prompt = cr.review_prompt(template, "o/r", 7, "light", "abc123", "pr", ".claude/review-pr.diff.numbered",
                               {"changed": [], "reverted": []}, cr.empty_state(), "first", 1, "Title", "body",
                               ignored=["environments/conda-lock.yml"])
@@ -443,11 +447,13 @@ def test_the_fixture_prompt_and_tiers_give_a_bounded_read_only_run():
     assert "scope" in schema["properties"]["findings"]["items"]["required"]
     assert set(CONFIG["tiers"]) == {"light", "full", "deep"}
     for tier in CONFIG["tiers"]:
-        command = cr.claude_command("claude", CONFIG["tiers"][tier], review_cfg["allowed_tools"])
+        budget, source = cr.tier_budget(CONFIG["tiers"][tier], tier, _BUDGETS)
+        command = cr.claude_command("claude", CONFIG["tiers"][tier], review_cfg["allowed_tools"], budget)
         value = {flag: command[i + 1] for i, flag in enumerate(command[:-1]) if flag.startswith("--")}
         assert value["--model"] == CONFIG["tiers"][tier]["model"]
-        # the owner's per-run cap: no tier may cost more than 50 USD per run
-        assert 0 < float(value["--max-budget-usd"]) <= 50 and int(value["--max-turns"]) > 0
+        # every run has a hard budget, the owner's from the secret, and a turn limit
+        assert float(value["--max-budget-usd"]) == json.loads(_BUDGETS)[tier] and int(value["--max-turns"]) > 0
+        assert cr.BUDGETS_ENV in source
         # --bare: billed strictly to ANTHROPIC_API_KEY, never to a Claude plan login
         assert "--bare" in command
         # no effort in the fixture config: the model's default applies, so no flag is sent
@@ -457,7 +463,8 @@ def test_the_fixture_prompt_and_tiers_give_a_bounded_read_only_run():
         assert set(command[-1].split(",")) <= {"Read", "Grep", "Glob"}
     assert CONFIG["rereview"]["verify_tier"] in CONFIG["tiers"] and int(CONFIG["rereview"]["max_rounds"]) >= 1
     # A tier with an effort level sends it, still ahead of the variadic tool list.
-    command = cr.claude_command("claude", {**CONFIG["tiers"]["full"], "effort": "xhigh"}, review_cfg["allowed_tools"])
+    command = cr.claude_command("claude", {**CONFIG["tiers"]["full"], "effort": "xhigh"}, review_cfg["allowed_tools"],
+                                7.25)
     assert command[command.index("--effort") + 1] == "xhigh" and command[-2] == "--allowedTools"
 
 
@@ -520,6 +527,7 @@ def test_a_verify_round_without_a_diff_still_calls_the_model_with_the_open_findi
     monkeypatch.setattr(cr.subprocess, "run", fake_run)
     monkeypatch.setattr(cr, "_pr_description", lambda repo, pr: ("T", "body"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv(cr.BUDGETS_ENV, _BUDGETS)
     monkeypatch.chdir(_CALLER)                      # the prompt file path in the config is relative to the checkout
     rc = cr.main(["review", "--config", str(_CONFIG_PATH), "--tier", "light",
                   "--diff-out", str(tmp_path / "review-pr.diff"),
@@ -528,6 +536,99 @@ def test_a_verify_round_without_a_diff_still_calls_the_model_with_the_open_findi
                   "--mode", "verify", "--round", "2"])
     assert rc == 0 and seen["command"][1] == "-p"
     assert "ROUND 2" in seen["prompt"] and "cccccccccccc-0" in seen["prompt"] and "braunschweig/z.py" in seen["prompt"]
+
+
+def test_the_budget_comes_from_the_secret_and_no_output_names_it(tmp_path, monkeypatch, capsys):
+    # The owner's decision of 2026-11-05: the budget per run is not published either. It comes from
+    # the organization secret the caller passes, binds the run as before, and no output names it.
+    (tmp_path / "state.json").write_text(json.dumps(_state_with_open()), encoding="utf-8")
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, "{}", "a CLI warning that names the budget, $7.25"
+
+    def fake_run(command, input=None, **kwargs):
+        seen["command"], seen["env"] = command, kwargs.get("env")
+        return Done()
+
+    monkeypatch.setattr(cr.subprocess, "run", fake_run)
+    monkeypatch.setattr(cr, "_pr_description", lambda repo, pr: ("T", "body"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv(cr.BUDGETS_ENV, _BUDGETS)
+    monkeypatch.chdir(_CALLER)
+    assert cr.main(["check-config", "--config", ".github/claude-review.yml"]) == 0
+    assert cr.main(["review", "--config", str(_CONFIG_PATH), "--tier", "full",
+                    "--diff-out", str(tmp_path / "review-pr.diff"), "--repo", "o/r", "--pr", "5", "--sha", "d" * 40,
+                    "--out", str(tmp_path / "result.json"), "--state", str(tmp_path / "state.json"),
+                    "--diff-source", "none", "--mode", "verify", "--round", "2"]) == 0
+    flags = {flag: seen["command"][i + 1] for i, flag in enumerate(seen["command"][:-1]) if flag.startswith("--")}
+    assert float(flags["--max-budget-usd"]) == 7.25                          # the full tier's budget binds the run
+    # the model's process does not get the budgets: it reads files, and a finding is posted publicly
+    assert seen["env"] is not None and cr.BUDGETS_ENV not in seen["env"] and seen["env"]["ANTHROPIC_API_KEY"] == "test"
+    printed = capsys.readouterr()
+    log = printed.out + printed.err
+    assert cr.BUDGETS_ENV in log and not [a for a in _BUDGET_AMOUNTS if a in log], log
+
+
+@pytest.mark.parametrize("budgets, expected", [
+    ('{"light": 3.5, "full": 7.25}', "has no budget for the tier 'deep'"),
+    ('{"light": 3.5, "full": 7.25, "deep": 9.75, "huge": 1}', "names an unknown tier 'huge'"),
+    ('{"light": 3.5, "full": 0, "deep": 9.75}', "budget of the tier 'full'"),
+    ('{"light": 3.5, "full": "7.25", "deep": 9.75}', "budget of the tier 'full'"),
+    ('{"light": 3.5, "full": true, "deep": 9.75}', "budget of the tier 'full'"),
+    ("[3.5, 7.25, 9.75]", "must be a JSON object"),
+    ("light=3.5", "must be a JSON object"),
+])
+def test_check_config_holds_the_budget_secret_to_every_tier_without_naming_an_amount(budgets, expected):
+    problems = cr.config_problems(CONFIG, _PROMPT, budgets=budgets)
+    assert any(expected in problem for problem in problems), problems
+    assert not [a for a in _BUDGET_AMOUNTS if a in " ".join(problems)], problems
+
+
+def test_a_budget_in_the_public_config_is_refused_once_the_secret_holds_the_budgets():
+    config = copy.deepcopy(CONFIG)
+    config["tiers"]["deep"]["max_budget_usd"] = 9.75
+    problems = cr.config_problems(config, _PROMPT, budgets=_BUDGETS)
+    assert any("'tiers.deep.max_budget_usd'" in p and "public" in p for p in problems), problems
+
+
+def test_without_the_secret_the_config_budgets_still_bound_the_run_and_say_so(tmp_path, monkeypatch, capsys):
+    # A caller that does not pass the secret yet keeps its config's budgets (no unbounded run), loudly;
+    # with neither, no review runs.
+    legacy = copy.deepcopy(CONFIG)
+    for name, budget in zip(("light", "full", "deep"), (3.5, 7.25, 9.75)):
+        legacy["tiers"][name]["max_budget_usd"] = budget
+    assert cr.config_problems(legacy, _PROMPT) == []
+    assert cr.tier_budget(legacy["tiers"]["full"], "full", "")[0] == 7.25
+    assert sum("has no budget" in problem for problem in cr.config_problems(CONFIG, _PROMPT)) == 3
+    path = tmp_path / "legacy.yml"
+    path.write_text(yaml.safe_dump(legacy), encoding="utf-8")
+    monkeypatch.delenv(cr.BUDGETS_ENV, raising=False)
+    monkeypatch.chdir(_CALLER)
+    assert cr.main(["check-config", "--config", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "::warning::" in out and cr.BUDGETS_ENV in out and not [a for a in _BUDGET_AMOUNTS if a in out]
+
+
+def test_an_amount_in_the_text_of_a_failed_run_is_redacted(tmp_path, monkeypatch, capsys):
+    # A run cut off by its budget may say so with the amount; the CLI's text reaches the log, the job
+    # summary and the summary comment, all public.
+    assert cr.redact_amounts("budget $1,234.50, 7 USD, USD 3 and 12 turns") == \
+        "budget [amount], [amount], [amount] and 12 turns"
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": True, "total_cost_usd": 9.75,
+                                       "num_turns": 12, "result": "Exceeded the budget of $9.75 (9.75 USD)"}),
+                           encoding="utf-8")
+    step_summary = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
+    run_record = tmp_path / "run.json"
+    assert cr.main(["outcome", "--execution-file", str(result_path), "--json", str(run_record)]) == 0
+    assert cr.main(["post", "--result", str(result_path), "--repo", "o/r", "--pr", "5", "--tier", "full",
+                    "--sha", "d" * 40, "--diff-file", str(result_path), "--dry-run"]) == 1
+    out = capsys.readouterr().out
+    assert "**Review failed:**" in out and "Exceeded the budget of [amount]" in out
+    for text in (out, step_summary.read_text(encoding="utf-8"), run_record.read_text(encoding="utf-8")):
+        assert "9.75" not in text
 
 
 def test_filter_diff_drops_ignored_files_for_the_model():
@@ -889,12 +990,13 @@ def test_verify_rounds_after_the_cap_are_configurable_and_zero_keeps_the_hard_st
 
 def test_verify_after_cap_is_optional_in_a_callers_config():
     """Callers' configs from before the key existed stay valid; a set value passes too."""
-    assert "verify_after_cap" not in CONFIG["rereview"] and cr.config_problems(CONFIG, _PROMPT) == []
+    assert "verify_after_cap" not in CONFIG["rereview"] and cr.config_problems(CONFIG, _PROMPT, budgets=_BUDGETS) == []
     config = copy.deepcopy(CONFIG)
     config["rereview"]["verify_after_cap"] = 1
-    assert cr.config_problems(config, _PROMPT) == []
+    assert cr.config_problems(config, _PROMPT, budgets=_BUDGETS) == []
     config["rereview"]["verify_after_kap"] = 1
-    assert any("unknown key 'rereview.verify_after_kap'" in p for p in cr.config_problems(config, _PROMPT))
+    assert any("unknown key 'rereview.verify_after_kap'" in p
+               for p in cr.config_problems(config, _PROMPT, budgets=_BUDGETS))
 
 
 def test_classify_without_a_context_is_the_first_round():
@@ -1202,6 +1304,15 @@ def test_the_reusable_workflow_wires_the_gate_and_the_rounds():
     call = _yaml_on(workflow)["workflow_call"]
     assert call["inputs"]["config"]["default"] == ".github/claude-review.yml"
     assert call["secrets"]["ANTHROPIC_API_KEY"]["required"] is True
+    # Optional, so a caller that does not pass it yet keeps working (check-config then names the gap).
+    assert call["secrets"]["CLAUDE_REVIEW_BUDGETS"]["required"] is False
+    # The budgets reach only the two steps that read them, never a whole job or another step.
+    for job_name, command in (("classify", '"$TOOL" check-config'), ("review", '"$TOOL" review ')):
+        job = workflow["jobs"][job_name]
+        assert "CLAUDE_REVIEW_BUDGETS" not in job.get("env", {})
+        with_budgets = [s for s in job["steps"] if "CLAUDE_REVIEW_BUDGETS" in s.get("env", {})]
+        assert len(with_budgets) == 1 and command in with_budgets[0]["run"], job_name
+        assert with_budgets[0]["env"]["CLAUDE_REVIEW_BUDGETS"] == "${{ secrets.CLAUDE_REVIEW_BUDGETS }}"
     # No queue here: a group shared by caller and called workflow deadlocks, so the caller holds it.
     assert "concurrency" not in workflow and all("concurrency" not in job for job in workflow["jobs"].values())
     classify_job, review_job = workflow["jobs"]["classify"], workflow["jobs"]["review"]
@@ -1259,7 +1370,7 @@ def test_both_jobs_run_the_script_of_the_workflows_own_version():
     assert len(fetch_scripts) == 1                              # both jobs fetch the same way
 
 
-def test_the_caller_template_holds_the_triggers_the_queue_the_permissions_and_one_secret():
+def test_the_caller_template_holds_the_triggers_the_queue_the_permissions_and_two_secrets():
     text = _CALLER_TEMPLATE.read_text(encoding="utf-8")
     caller = yaml.safe_load(text)
     assert _yaml_on(caller)["pull_request"]["types"] == ["opened", "synchronize", "reopened", "ready_for_review",
@@ -1273,8 +1384,9 @@ def test_the_caller_template_holds_the_triggers_the_queue_the_permissions_and_on
     (job,) = caller["jobs"].values()
     major = re.search(r"^## v(\d+)\.\d+\.\d+", (_REPO / "CHANGELOG.md").read_text(encoding="utf-8"), re.MULTILINE)
     assert job["uses"] == f"TUBS-IVS/claude-pr-review/.github/workflows/review.yml@v{major.group(1)}"
-    # Only the API key reaches the central code; `secrets: inherit` would hand over every secret.
-    assert job["secrets"] == {"ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}"}
+    # Only the API key and the budgets reach the central code; `secrets: inherit` would hand over every secret.
+    assert job["secrets"] == {"ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}",
+                              "CLAUDE_REVIEW_BUDGETS": "${{ secrets.CLAUDE_REVIEW_BUDGETS }}"}
     # A called workflow can narrow the token but never widen it: the caller grants what each job needs.
     for name, called in yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))["jobs"].items():
         for scope, level in called["permissions"].items():
@@ -1286,9 +1398,6 @@ _PROMPT = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8"
 
 
 @pytest.mark.parametrize("mutate, expected", [
-    (lambda c: c["tiers"]["full"].update(max_budget_usd=60.0),
-     "'tiers.full.max_budget_usd' must be above 0 and at most 50 USD (the per-run cap), got 60.0"),
-    (lambda c: c["tiers"]["light"].update(max_budget_usd=0), "'tiers.light.max_budget_usd' must be above 0"),
     (lambda c: c["tiers"]["deep"].update(max_turns=True), "'tiers.deep.max_turns' must be a whole number >= 1"),
     (lambda c: c["tiers"].pop("deep"), "'tiers.deep' is missing"),
     (lambda c: c["tiers"]["full"].update(modle="x"), "unknown key 'tiers.full.modle'"),
@@ -1313,7 +1422,7 @@ _PROMPT = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8"
 def test_check_config_names_each_way_a_config_breaks_or_unbounds_the_run(mutate, expected):
     config = copy.deepcopy(CONFIG)
     mutate(config)
-    problems = cr.config_problems(config, _PROMPT)
+    problems = cr.config_problems(config, _PROMPT, budgets=_BUDGETS)
     assert any(expected in problem for problem in problems), problems
 
 
@@ -1325,18 +1434,19 @@ def test_check_config_names_each_way_a_config_breaks_or_unbounds_the_run(mutate,
     (None, "cannot be read"),
 ])
 def test_check_config_rejects_a_prompt_that_would_break_the_run(template, expected):
-    problems = cr.config_problems(CONFIG, template)
+    problems = cr.config_problems(CONFIG, template, budgets=_BUDGETS)
     assert any(expected in problem for problem in problems), problems
 
 
 def test_check_config_passes_the_fixture_and_fails_loudly_on_a_broken_config(tmp_path, monkeypatch, capsys):
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv(cr.BUDGETS_ENV, _BUDGETS)
     monkeypatch.chdir(_CALLER)                    # the prompt path in the config is relative to the checkout
     assert cr.main(["check-config", "--config", ".github/claude-review.yml"]) == 0
     assert "OK" in capsys.readouterr().out and not summary.exists()
     broken = copy.deepcopy(CONFIG)
-    broken["tiers"]["deep"]["max_budget_usd"] = 500.0
+    broken["tiers"]["deep"]["max_budget_usd"] = 500.0         # public, although the secret holds the budgets
     broken["review"]["allowed_tools"] = ["Read", "Bash"]
     path = tmp_path / "broken.yml"
     path.write_text(yaml.safe_dump(broken), encoding="utf-8")

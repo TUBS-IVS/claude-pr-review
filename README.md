@@ -24,26 +24,31 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
 ## Adopt it in a repository
 
 1. Add the repository secret `ANTHROPIC_API_KEY`: a key of a **workspace** of the Console organization (an
-   organization-level key fails). Only this secret is handed to the shared workflow.
-2. Copy [`examples/claude-review.yml`](examples/claude-review.yml) to `.github/workflows/claude-review.yml`. Keep that
+   organization-level key fails).
+2. Give the repository access to the organization secret `CLAUDE_REVIEW_BUDGETS`: each tier's hard budget per run
+   in USD as JSON, `{"light": <usd>, "full": <usd>, "deep": <usd>}`. The budgets are the owner's and are not published
+   (the owner's decision of 2026-11-05), so they are in no config. These two secrets are all the shared workflow gets.
+3. Copy [`examples/claude-review.yml`](examples/claude-review.yml) to `.github/workflows/claude-review.yml`. Keep that
    file name (the maintainer's session retro lists review runs by it). Adjust only the triggers: the base branch
    (`branches: [main]`) and, if needed, `paths-ignore` for files no review should ever start for.
-3. Add the gate config `.github/claude-review.yml`. Start from a sibling repository's or from
+4. Add the gate config `.github/claude-review.yml`. Start from a sibling repository's or from
    [`tests/fixtures/caller/.github/claude-review.yml`](tests/fixtures/caller/.github/claude-review.yml) and set its
    paths for your repository. Keys: `labels` (`force`, `skip`), `skip_drafts`, `critical_paths`, `structure_paths`,
    `ignored_paths`, `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`, an optional
    `verify_after_cap`: verify rounds for fixes after the cap, default 2), `tiers` (`light`, `full`,
-   `deep`, each with `model`, `max_turns`, `max_budget_usd` of at most 50 USD and an optional `effort`: `low`,
-   `medium`, `high`, `xhigh` or `max`; without it the model's default effort applies) and `review` (`prompt_file`,
-   `allowed_tools` from Read, Grep, Glob). Make the caller, the config and the prompt critical paths.
-4. Add the prompt named by `review.prompt_file`. Placeholders: `{{REPO}}`, `{{PR}}`, `{{TIER}}`, `{{SHA}}`,
+   `deep`, each with `model`, `max_turns` and an optional `effort`: `low`, `medium`, `high`, `xhigh` or `max`; without
+   it the model's default effort applies) and `review` (`prompt_file`, `allowed_tools` from Read, Grep, Glob). A
+   tier's `max_budget_usd` is deprecated: it is used only while the caller does not pass the budgets secret, with a
+   warning, and refused once it does. Make the caller, the config and the prompt critical paths.
+5. Add the prompt named by `review.prompt_file`. Placeholders: `{{REPO}}`, `{{PR}}`, `{{TIER}}`, `{{SHA}}`,
    `{{PR_TITLE}}`, `{{DIFF_BLOCK}}` and `{{ROUND_BLOCK}}` (both required), and `{{PR_BODY}}` between two `{{FENCE}}`
    lines (so the author's text stays data).
-5. Create the two labels named in the config (`claude-review` adds one deep review, `skip-claude-review` stops it).
+6. Create the two labels named in the config (`claude-review` adds one deep review, `skip-claude-review` stops it).
 
 The gate job checks the config and the prompt on every pull request (`check-config`) and fails, before anything is
 spent, with one error line per problem. Locally: `python claude_review.py check-config --config
-.github/claude-review.yml`, run from the root of the calling repository.
+.github/claude-review.yml`, run from the root of the calling repository with the budgets in the environment
+variable `CLAUDE_REVIEW_BUDGETS`.
 
 ## Versions
 

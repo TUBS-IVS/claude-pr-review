@@ -14,13 +14,23 @@ major version, and callers name the major tag (README.md, "Versions"). The newes
   - The run record (job summary, log line, artifact `claude-review-cost-*`) gives status, tier, model, turns and
     duration: no cost and no token counts, which give the cost at the public prices.
   - The findings record keeps the key `cost_usd`, always empty (schema 2 only adds fields).
+- The budgets per run are not published either. They come from the new optional secret `CLAUDE_REVIEW_BUDGETS` (an
+  organization secret, JSON with each tier's budget in USD), which the caller passes next to `ANTHROPIC_API_KEY`
+  (`examples/claude-review.yml`). Only the gate and the review step get it, the model's own process does not, and no
+  output names a budget. `check-config` validates it without quoting a value and refuses a `max_budget_usd` left in
+  the config while the secret is set. A caller that does not pass the secret yet still runs on its config's
+  `max_budget_usd`, with a warning on every run; the code holds no upper bound for that value any more.
+- A money amount in a text of the CLI that the review publishes (the error of a failed run, the CLI's own warnings in
+  the log) is replaced by `[amount]`: a run cut off by its budget may name it.
 - The command `cost` is `outcome` now. File and artifact of the run record keep their v1 names.
-- Minor release: the config keys, the caller's interface, the artifact names and the fields of the findings record
-  stay, and a state block of an earlier version is read as before. Moving `v1` back below v1.3.0 would count the
-  rounds that v1.3.0 recorded as free (they carry no `cost_usd`); roll forward instead.
-- Unchanged: the budget caps in each caller's config (limits, not spending). Outputs written before this release keep
-  their amounts (earlier comment revisions, and logs, job summaries and artifacts within their retention). The cost
-  of the reviews is in the Anthropic Console, under the workspace of each repository's API key.
+- Minor release: the config keys (`max_budget_usd` stays valid without the secret), the caller's interface (the new
+  secret is optional), the artifact names and the fields of the findings record stay, and a state block of an earlier
+  version is read as before. Moving `v1` back below v1.3.0 would count the rounds that v1.3.0 recorded as free (they
+  carry no `cost_usd`), and a caller that passes the budgets secret would fail on an older version; roll forward
+  instead.
+- Outputs written before this release keep their amounts (earlier comment revisions, and logs, job summaries and
+  artifacts within their retention). The cost of the reviews is in the Anthropic Console, under the workspace of each
+  repository's API key.
 
 ## v1.2.0 (2026-11-05)
 
@@ -50,7 +60,7 @@ First release as a central repository (ADR-0176 in TUBS-IVS/eqasim-bs).
   (`match_comment_ids`; GitHub's listing of a review's comments has no `line` field, so before the fix every
   findings record carried `comment_id` None).
 - New command `check-config`, run first by the gate job: it validates the calling repository's gate config and
-  prompt and fails the gate, before anything is spent, on a missing tier, a budget above 50 USD per run, a tool
+  prompt and fails the gate, before anything is spent, on a missing tier, a budget above the owner's cap per run, a tool
   beyond Read/Grep/Glob, a misspelt key or an unknown prompt placeholder.
 - The reusable workflow `.github/workflows/review.yml` (the two jobs of the former per-repository workflow) fetches
   the script at its own commit (`job.workflow_sha`); callers keep triggers, queue and permissions
