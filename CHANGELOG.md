@@ -3,13 +3,15 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
-## Unreleased
+## v1.4.0 (2026-11-11)
 
 - A tier's `model` may be an alias such as `fable` or `opus`; the pinned CLI resolves it to the newest version it
   knows. The run record (log line, job summary, artifact) names the version called next to the configured name
   (new field `models_used`).
 - Claude Code CLI 2.1.322 (was 2.1.309); Fable 5.2 needs 2.1.321 or later.
 - New workflow `bump-claude-code.yml`: every Monday it opens a pull request when npm has a newer Claude Code CLI.
+- Minor release: full model ids stay valid, and the config keys, the caller's interface, the artifact names and the
+  findings record are unchanged; the run record only gains `models_used`.
 
 ## v1.3.0 (2026-11-05)
 
