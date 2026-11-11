@@ -1,0 +1,76 @@
+name: Bump Claude Code CLI
+
+# Opens a pull request when npm has a newer @anthropic-ai/claude-code than the CLAUDE_CODE_VERSION pinned in
+# review.yml, so that the review runs the newest CLI and a model alias in a tier (`fable`, `opus`) resolves
+# to the newest model version, while every bump still goes through a reviewed pull request and a release
+# (docs/how-it-works.md, "Rules for maintainers").
+#
+# A pull request opened with the GITHUB_TOKEN starts no other workflow, so Tests does not run on it by
+# itself: this job runs the tests before it opens the pull request, and Tests can be started by hand on the
+# branch. Needs the repository setting "Allow GitHub Actions to create and approve pull requests".
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-claude-code
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Compare the pinned version with the newest release
+        id: version
+        run: |
+          pinned=$(sed -nE 's/^      CLAUDE_CODE_VERSION: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' .github/workflows/review.yml)
+          latest=$(npm view @anthropic-ai/claude-code version)
+          if [ -z "$pinned" ] || ! echo "$latest" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::cannot read the pinned version ('$pinned') or the newest release ('$latest')"; exit 1
+          fi
+          newest=$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -n 1)
+          echo "Pinned $pinned, newest release $latest"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$newest" = "$pinned" ]; then echo "bump=false" >> "$GITHUB_OUTPUT"; else echo "bump=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Open the pull request
+        if: steps.version.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED: ${{ steps.version.outputs.pinned }}
+          LATEST: ${{ steps.version.outputs.latest }}
+        run: |
+          branch="bump/claude-code-$LATEST"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            echo "Branch $branch exists already; nothing to do."; exit 0
+          fi
+          sed -i -E "s/^(      CLAUDE_CODE_VERSION: )\"[0-9.]+\"$/\1\"$LATEST\"/" .github/workflows/review.yml
+          pip install pytest pyyaml
+          python -m pytest -q tests
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "Pin Claude Code CLI $LATEST"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "Pin Claude Code CLI $LATEST" --body "$(cat <<EOF
+          npm has \`@anthropic-ai/claude-code\` $LATEST; review.yml pins $PINNED. The new version also changes what a
+          model alias in a tier (\`fable\`, \`opus\`) resolves to.
+
+          The tests passed in the job that opened this pull request; Tests does not start by itself on a pull
+          request of the GITHUB_TOKEN, start it by hand on this branch. Before merging, run the review once from a
+          test branch of a calling repository (README.md, "Test a change before release"). A merge reaches the
+          calling repositories only when the major tag moves.
+          EOF
+          )"

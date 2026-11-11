@@ -185,8 +185,9 @@ the free `classify` job; suppressing them in the caller would copy the label nam
 ## The review run and the posting
 
 - `review` fills the placeholders of the prompt file (`review.prompt_file`) and runs `claude -p` with the tier's
-  `model`, its `effort` when the config sets one (`--effort`; otherwise the model's default: medium on Opus 5.5 and
-  Sonnet 5.5, high on Fable 5.1, per the Claude Code docs "Model configuration"; the log line of the run names it),
+  `model` (a full id, or an alias such as `fable` that the pinned CLI resolves to the newest version it knows,
+  Claude Code docs "Model configuration"; the run record names the version called, "Run record"), its `effort` when
+  the config sets one (`--effort`; otherwise the model's default, per the same docs page; the log line names it),
   `max_turns`, the tier's budget (`tier_budget`: from the secret, "The gate"; a hard cap per run, never printed: the
   log line names only its source), the JSON schema `FINDINGS_SCHEMA`, `--bare`
   (authentication strictly by `ANTHROPIC_API_KEY`, never a Claude plan login; no user hooks, plugins, memory or
@@ -242,7 +243,9 @@ The outcome is read from the replies in the finding's review thread, so answer e
 ## Run record
 
 After every review, `claude_review.py outcome` reads the `claude -p` JSON result and reports how the run ended: its
-status, tier, model, turns and duration **as the CLI reported them**. It writes a table to the job summary and uploads
+status, tier, model, turns and duration **as the CLI reported them**. For the model it gives the configured name
+and, when that is an alias, the ids the CLI called (`models_used`, the keys of the result's `modelUsage`), e.g.
+`fable (claude-fable-5-2)`. It writes a table to the job summary and uploads
 `claude-review-cost.json` as the artifact `claude-review-cost-pr<NN>-run<id>-<attempt>` (90 days; file and artifact
 keep their v1 names, README.md "Contract with the session retro"). A missing record fails the step instead of
 reporting a zero. A run that ended early (`subtype` other than `success`, e.g. `error_max_turns`, or `is_error`) is
@@ -280,7 +283,12 @@ in the Console.
   valid, a test, and a line in CHANGELOG.md; a key that old configs must add is a new major version.
 - Keep the review advisory until its findings have been checked against real PRs; making it a required check is a
   separate decision of each repository.
-- Bump the pinned CLI version (`CLAUDE_CODE_VERSION` in the workflow) deliberately.
+- The pinned CLI version (`CLAUDE_CODE_VERSION` in review.yml) changes only through a pull request. Every Monday
+  `bump-claude-code.yml` compares it with the newest npm release and, when that is newer, runs the tests and opens
+  one (`bump/claude-code-<version>`). A pull request of the GITHUB_TOKEN starts no other workflow: start Tests by
+  hand on it, and test it from a calling repository like any change of the workflow, because the pin also decides
+  what a model alias resolves to. The job needs the repository setting "Allow GitHub Actions to create and approve
+  pull requests".
 - Keep the model read-only: posting belongs in `post`, not in the model's tools.
 - Never write the API cost, a token count or a budget into an output of a run (comment, state block, log, job
   summary, artifact; "Run record"): every one is public for a public repository. Tests feed a result with a cost and

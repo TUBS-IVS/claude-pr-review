@@ -317,6 +317,26 @@ def test_a_failed_run_that_cost_money_is_recorded_and_counts_against_the_cap(tmp
     assert "no review result" in capsys.readouterr().out and not written
 
 
+def test_outcome_names_the_model_an_alias_resolved_to(tmp_path, monkeypatch, capsys):
+    # A tier may name an alias (`fable`); the run record and the summary say which version the CLI called.
+    execution = tmp_path / "exec.json"
+    execution.write_text(json.dumps([{"type": "result", "subtype": "success", "is_error": False,
+                                      "num_turns": 3, "duration_ms": 1000,
+                                      "modelUsage": {"claude-fable-5-2": {"inputTokens": 41213, "costUSD": 7.3519}}}]),
+                         encoding="utf-8")
+    out, summary = tmp_path / "run.json", tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert cr.main(["outcome", "--execution-file", str(execution), "--tier", "deep", "--model", "fable",
+                    "--json", str(out)]) == 0
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert (record["model"], record["models_used"]) == ("fable", ["claude-fable-5-2"])
+    assert "model fable (claude-fable-5-2)" in capsys.readouterr().out
+    assert "| fable (claude-fable-5-2) |" in summary.read_text(encoding="utf-8")
+    # A full id that matches what was called is not repeated.
+    assert cr.main(["outcome", "--execution-file", str(execution), "--model", "claude-fable-5-2"]) == 0
+    assert "model claude-fable-5-2," in capsys.readouterr().out
+
+
 # What no public output may show (the owner's request of 2026-11-05): the API cost of a run and its
 # token counts, which give the cost at the public prices. Distinct values, so a hit is never a coincidence.
 _RESULT_WITH_COST = {
@@ -1343,6 +1363,18 @@ def test_the_reusable_workflow_wires_the_gate_and_the_rounds():
     assert all(step.get("if") == "always()" for step in uploads.values())
     assert review_job["steps"][-1]["with"]["path"] == "${{ runner.temp }}/claude-review-findings.json"
     _no_label_names(text)
+
+
+def test_the_bump_workflow_finds_the_cli_pin():
+    # bump-claude-code.yml reads and rewrites the pin with a line regex; the pin must stay in that one form.
+    pins = re.findall(r'(?m)^      CLAUDE_CODE_VERSION: "(\d+\.\d+\.\d+)"$', _WORKFLOW.read_text(encoding="utf-8"))
+    assert len(pins) == 1
+    bump_text = (_WORKFLOW.parent / "bump-claude-code.yml").read_text(encoding="utf-8")
+    assert r's/^      CLAUDE_CODE_VERSION: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' in bump_text
+    assert r's/^(      CLAUDE_CODE_VERSION: )\"[0-9.]+\"$/' in bump_text
+    bump = yaml.safe_load(bump_text)
+    assert set(_yaml_on(bump)) == {"schedule", "workflow_dispatch"}
+    assert bump["permissions"] == {"contents": "read"}
 
 
 def test_both_jobs_run_the_script_of_the_workflows_own_version():

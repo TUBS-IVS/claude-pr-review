@@ -153,9 +153,10 @@ jobs:
       pull-requests: write
       issues: write
     env:
-      # Claude Code CLI, pinned for reproducible review behaviour. 2.1.309 is the version
-      # claude-code-action v1.0.259 installed and that reached the API with Opus 5.5.
-      CLAUDE_CODE_VERSION: "2.1.309"
+      # Claude Code CLI, pinned for reproducible review behaviour. The pinned version also decides what
+      # a model alias in a tier (`fable`, `opus`) resolves to. bump-claude-code.yml opens a pull request
+      # when npm has a newer release; keep this line in this exact form, that workflow rewrites it.
+      CLAUDE_CODE_VERSION: "2.1.322"
       CONFIG: ${{ inputs.config }}
       TIER: ${{ needs.classify.outputs.tier }}
       MODEL: ${{ needs.classify.outputs.model }}
