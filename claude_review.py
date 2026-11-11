@@ -641,7 +641,7 @@ def config_problems(config, prompt_template, budgets: str = "") -> list:
         problems += [f"unknown key 'tiers.{name}.{key}' (known: {', '.join(TIER_KEYS)})"
                      for key in sorted(set(tier) - set(TIER_KEYS))]
         if not (isinstance(tier.get("model"), str) and tier["model"].strip()):
-            problems.append(f"'tiers.{name}.model' must be a model id")
+            problems.append(f"'tiers.{name}.model' must be a model id or alias")
         if not (_whole(tier.get("max_turns")) and tier["max_turns"] >= 1):
             problems.append(f"'tiers.{name}.max_turns' must be a whole number >= 1, got {tier.get('max_turns')!r}")
         if secret and "max_budget_usd" in tier:
@@ -718,6 +718,9 @@ def run_outcome(result: dict) -> dict:
         # On a failed run the result text carries the error (e.g. the API's message), which the
         # action itself hides in its log; keep it so the failure is diagnosable.
         "error_text": redact_amounts(str(result.get("result", "")))[:1000] if result.get("is_error") else "",
+        # The model ids the CLI actually called (the keys of modelUsage, never their counts): a tier may
+        # name an alias such as `fable`, which the pinned CLI resolves to a concrete version.
+        "models_used": sorted(str(m) for m in (result.get("modelUsage") or {})),
     }
 
 
@@ -1398,13 +1401,16 @@ def _cmd_outcome(args) -> int:
         _append("GITHUB_STEP_SUMMARY", f"### Claude review run\n\n**No run record:** {error}\n")
         return 1
     outcome.update({"tier": args.tier, "model": args.model})
+    # The configured name and, when it differs, what the CLI called: an alias reads "fable (claude-fable-5-2)".
+    used = ", ".join(outcome["models_used"])
+    model_text = (args.model or "-") + (f" ({used})" if used and used != args.model else "")
     # A run cut off by --max-turns or an API error is not a complete review.
     # The SDK can report subtype "success" together with is_error (an API error on the first call).
     if outcome["is_error"]:
         status = "error" if outcome["subtype"] == "success" else outcome["subtype"]
     else:
         status = "complete" if outcome["subtype"] == "success" else outcome["subtype"]
-    print(f"[claude-review] {status}: tier {args.tier or '-'}, model {args.model or '-'}, "
+    print(f"[claude-review] {status}: tier {args.tier or '-'}, model {model_text}, "
           f"{outcome['num_turns']} turns, {outcome['duration_s']} s")
     if status != "complete":
         print(f"::warning::Claude review did not complete ({status}); the review is partial.")
@@ -1413,7 +1419,7 @@ def _cmd_outcome(args) -> int:
         print(f"::error::Claude run error: {' '.join(outcome['error_text'].split())}")
     _append("GITHUB_STEP_SUMMARY",
             "### Claude review run\n\n| Status | Tier | Model | Turns | Duration (s) |\n|---|---|---|---|---|\n"
-            f"| {status} | {args.tier or '-'} | {args.model or '-'} | {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
+            f"| {status} | {args.tier or '-'} | {model_text} | {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
             "Source: the `result` record of the Claude Code execution file.\n"
             + (f"\n**Run error:** `{' '.join(outcome['error_text'].split())}`\n" if outcome["error_text"] else ""))
     if args.json_out:

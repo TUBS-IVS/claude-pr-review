@@ -39,7 +39,8 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
    paths for your repository. Keys: `labels` (`force`, `skip`), `skip_drafts`, `critical_paths`, `structure_paths`,
    `ignored_paths`, `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`, an optional
    `verify_after_cap`: verify rounds for fixes after the cap, default 2), `tiers` (`light`, `full`,
-   `deep`, each with `model`, `max_turns` and an optional `effort`: `low`, `medium`, `high`, `xhigh` or `max`; without
+   `deep`, each with `model` (an alias such as `fable` or `opus` follows the newest version the pinned CLI knows; a
+   full id such as `claude-opus-5-5` holds one version), `max_turns` and an optional `effort`: `low`, `medium`, `high`, `xhigh` or `max`; without
    it the model's default effort applies) and `review` (`prompt_file`, `allowed_tools` from Read, Grep, Glob). A
    tier's `max_budget_usd` is deprecated: it is used only while the caller does not pass the budgets secret, with a
    warning, and refused once it does. Make the caller, the config and the prompt critical paths.
