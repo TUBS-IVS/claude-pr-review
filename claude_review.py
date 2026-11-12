@@ -10,7 +10,8 @@
         [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N --effort E]
     python claude_review.py post --result result.json --repo OWNER/NAME --pr 12 \
         --tier full --sha <head sha> [--diff-file pr.diff] [--dry-run]
-    python claude_review.py outcome --execution-file result.json [--tier full] [--model m] [--json out.json]
+    python claude_review.py outcome --execution-file result.json [--tier full] [--model m] [--effort E] \
+        [--json out.json]
 
 All commands run from the root of the reviewed repository's checkout: the config path, the prompt
 file it names and the diff file are relative to it.
@@ -548,8 +549,13 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
     # on the full tier, because nearly all code of a repository is a critical path, however few lines
     # it changes (`rereview.small_push_lines`, optional). A structure change is never small, and the
     # check never runs on a higher tier than the rules give the push.
+    # The lines of a push say nothing about a file it took out of the PR (`reverted`: what the file
+    # held may still be used) or about a file without countable lines (binary), so neither is small.
     limit = rereview.get("small_push_lines")
-    if tier != "none" and limit is not None and measured[0] <= int(limit) and not structure[2]:
+    unmeasured = context.reverted or [path for path, lines in context.changed_entries
+                                      if not lines and not matches_any(path, config.get("ignored_paths", []))]
+    if (tier != "none" and limit is not None and measured[0] <= int(limit) and not structure[2]
+            and not unmeasured):
         if TIER_NAMES.index(verify) < TIER_NAMES.index(tier):
             return decide(verify, f"{verify}: a small push (at most {limit} changed lines) is checked on the verify "
                                   f"tier instead of {why}", "rereview", "interdiff", check=True)
@@ -805,8 +811,10 @@ def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, 
     reading = ("Read ALL of it with Read, page by page (offset/limit) when it is long, before you conclude. "
                "Left of the `|` every added (`+`) and context (` `) line carries its line number in the NEW "
                "version of the file; deleted (`-`) lines and headers carry none.")
+    # A file the push took out of the PR may leave its users behind, in hunks that did not change.
     gone = (f" These files were in the PR's change at the last reviewed commit and are not any more "
-            f"(reverted to main or renamed): {', '.join(reverted)}." if reverted else "")
+            f"(reverted to main or renamed): {', '.join(reverted)}. Check that nothing left in the PR still relies "
+            "on what they held." if reverted else "")
     left_out = (f" These changed files are left out of the diff as ignored paths (generated, binary or "
                 f"machine-written): {', '.join(ignored)}. Check against the PR description that their change "
                 f"is declared." if ignored else "")
@@ -817,9 +825,10 @@ def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, 
                 f"the files whose change differs from the last reviewed commit ({', '.join(changed)}), cut down "
                 "to what changed since then. A line that starts with `>` is new or changed since the last "
                 "reviewed commit. The unmarked lines around it are context that an earlier round reviewed. A "
-                "line whose text starts with `~` names a change that left no line to mark: lines that were "
-                "removed, or a part of the file that is as on the base branch now. A line `... N lines left out "
-                "...` stands for an unchanged part, which you can open in the file itself with Read. "
+                "line whose text starts with `~` is a note on a change that left no line to mark: where lines "
+                "were removed, where else the file changed, or why a hunk or a file is shown whole. A line `... N "
+                "lines left out ...` or `... N hunks left out ...` stands for an unchanged part, which you can open "
+                "in the file itself with Read. "
                 f"{reading} Review the changes marked `>` and `~`: whether each one is right, and whether it "
                 "breaks the code around it or code elsewhere. Report nothing about an unmarked line unless a "
                 "marked change makes it wrong or the defect is of high severity. The other files of the PR were "
@@ -1011,10 +1020,10 @@ def _delta_line(mark: str, number, text: str) -> str:
     return f"{mark}{number if number is not None else '':>6} |{text}"
 
 
-def _delta_section(text: str, changes, context: int) -> list:
-    """The lines of number_delta for one file section; ``changes`` are that file's hunks from
-    changed_since, or None when git named no changed line of it."""
-    headers, hunks = [], []  # hunks: [header line, [[raw line, new-side number, mark], ...]]
+def _section_hunks(text: str) -> tuple:
+    """(header lines, hunks) of one file section of a unified diff; a hunk is
+    ``[header line, [[raw line, new-side line number or None, mark], ...]]``."""
+    headers, hunks = [], []
     for raw, _, number, inside in _walk(text):
         if inside or (hunks and raw.startswith("\\")):
             hunks[-1][1].append([raw, number, ""])
@@ -1022,15 +1031,29 @@ def _delta_section(text: str, changes, context: int) -> list:
             hunks.append([raw, []])
         else:
             headers.append(raw)
+    return headers, hunks
+
+
+def _delta_section(text: str, changes, then_text: str, context: int) -> tuple:
+    """(lines, counts) of number_delta for one file section. ``changes`` are that file's hunks from
+    changed_since, or None when git named no changed line of it; ``then_text`` is the file's section
+    of the PR's diff at the last reviewed commit ("" when it had none)."""
+    headers, hunks = _section_hunks(text)
     out = [_delta_line(" ", None, raw) for raw in headers]
+    counts = {"marked": 0, "notes": 0, "hunks_left_out": 0, "whole": 0}
     if changes is None:
         # A binary file or a mode change: nothing can be cut away safely, so nothing is.
         out.append(_delta_line(" ", None, "~ no changed line of this file is known since the last reviewed commit: "
                                           "its whole section follows"))
+        counts.update(notes=1, whole=1)
         for header, lines in hunks:
             out.append(_delta_line(" ", None, header))
             out += [_delta_line(" ", number, raw) for raw, number, _ in lines]
-        return out
+        return out, counts
+    reviewed = _section_hunks(then_text)[1]
+    reviewed_hunks = {tuple(raw for raw, _, _ in lines) for _, lines in reviewed}
+    reviewed_removals = {raw for _, lines in reviewed for raw, number, _ in lines
+                         if number is None and raw.startswith("-")}
     added = {line for start, count, _ in changes for line in range(start, start + count)}
     # Where old lines went: right after this line of the file at head.
     removed_after = {start if count == 0 else start - 1 for start, count, old in changes if old}
@@ -1047,9 +1070,20 @@ def _delta_section(text: str, changes, context: int) -> list:
                 if number in added:
                     line[2] = ">"
             elif raw.startswith("-") and position in removed_after:
-                # A line of the base branch the push deleted (with it, deletions made there before).
+                # A line of the base branch the push deleted (with it, deletions made there before:
+                # git does not say which of the deleted lines at this place are the push's).
                 line[2] = ">"
                 shown_removals.add(position)
+            elif raw.startswith("-") and raw not in reviewed_removals:
+                # A deletion no earlier round saw: the base branch changed the line the PR removes (a
+                # merge), so what the PR does here changed although no line of it did at head.
+                line[2] = ">"
+    # A hunk that removes lines and is not, line for line, a hunk an earlier round read is never cut
+    # down and never left out: what it removes can change without a changed line at head, and a
+    # removed line that reads like another one was (a blank line, "pass") cannot be told apart by
+    # its text. Decided before the notes below are put between the lines.
+    whole = [any(number is None and raw.startswith("-") for raw, number, _ in lines)
+             and tuple(raw for raw, _, _ in lines) not in reviewed_hunks for _, lines in hunks]
     # Every change of the push leaves a trace: a part of the PR's change that was taken back would
     # otherwise pass unseen, and the code that used it may still be there. Lines the PR had added and
     # the push removed leave no line in the PR's diff, so a note stands where they stood; a change
@@ -1057,8 +1091,14 @@ def _delta_section(text: str, changes, context: int) -> list:
     elsewhere = []
     for start, count, _ in changes:
         if count:
-            if not visible.intersection(range(start, start + count)):
-                elsewhere.append(start)
+            # The first line of each part of the change that no hunk shows; the rest of it is marked.
+            hidden = False
+            for line in range(start, start + count):
+                if line in visible:
+                    hidden = False
+                elif not hidden:
+                    elsewhere.append(line)
+                    hidden = True
             continue
         if start in shown_removals:
             continue
@@ -1072,13 +1112,14 @@ def _delta_section(text: str, changes, context: int) -> list:
                 lines.insert(numbers.index(start) + 1, note)
                 break
         else:
-            elsewhere.append(start)
+            elsewhere.append(max(start, 1))  # a removal at the top of the file is named by its first line
     if elsewhere:
         places = ", ".join(str(line) for line in elsewhere[:10]) + (f" (+{len(elsewhere) - 10} more)"
                                                                    if len(elsewhere) > 10 else "")
         out.append(_delta_line(" ", None, f"~ since the last reviewed commit this file also changed at line {places}, "
                                           "where it is as on the base branch now (a change of the base branch, or a "
                                           "part of the PR's change that was taken back): open the file to see it"))
+        counts["notes"] += 1
 
     def shown(line: list) -> str:
         return _delta_line(">" if line[2] == ">" else " ", line[1], line[0])
@@ -1087,16 +1128,23 @@ def _delta_section(text: str, changes, context: int) -> list:
         return _delta_line(" ", None, f"... {count} hunk{'' if count == 1 else 's'} left out: {_UNCHANGED} ...")
 
     dropped = 0
-    for header, lines in hunks:
+    for (header, lines), all_of_it in zip(hunks, whole):
         anchors = [index for index, line in enumerate(lines) if line[2]]
-        if not anchors:
+        if not anchors and not all_of_it:
             dropped += 1
             continue
         if dropped:
             out.append(left_out_hunks(dropped))
+            counts["hunks_left_out"] += dropped
             dropped = 0
         out.append(_delta_line(" ", None, header))
-        keep = [False] * len(lines)
+        counts["marked"] += sum(line[2] == ">" for line in lines)
+        counts["notes"] += sum(line[2] == "~" for line in lines)
+        if not anchors:
+            out.append(_delta_line(" ", None, "~ this hunk is not as an earlier round reviewed it, although no line of "
+                                              "it changed at head: the base branch changed under it"))
+            counts["notes"] += 1
+        keep = [all_of_it] * len(lines)
         for anchor in anchors:
             for index in range(max(0, anchor - context), min(len(lines), anchor + context + 1)):
                 keep[index] = True
@@ -1117,24 +1165,37 @@ def _delta_section(text: str, changes, context: int) -> list:
             index = end + 1
     if dropped:
         out.append(left_out_hunks(dropped))
-    return out
+        counts["hunks_left_out"] += dropped
+    return out, counts
 
 
-def number_delta(diff_text: str, delta: dict, context: int = DELTA_CONTEXT) -> str:
+def _delta_view(diff_text: str, delta: dict, then_text: str, context: int = DELTA_CONTEXT) -> tuple:
+    """(text, counts) of number_delta: the counts say how much was cut away and how much could not
+    be (marked lines, notes, hunks left out, files shown whole), for the log of the run."""
+    then = {path: text for path, text in split_sections(then_text) if path}
+    out, totals = [], {"marked": 0, "notes": 0, "hunks_left_out": 0, "whole": 0}
+    for path, text in split_sections(diff_text):
+        lines, counts = _delta_section(text, delta.get(path) if path else None, then.get(path, ""), context)
+        out += lines
+        for key, value in counts.items():
+            totals[key] += value
+    return "\n".join(out) + ("\n" if out else ""), totals
+
+
+def number_delta(diff_text: str, delta: dict, then_text: str, context: int = DELTA_CONTEXT) -> str:
     """The diff of a further round as the model reads it: number_diff's line numbers behind a
     column that marks with ">" every line that is new or changed since the last reviewed commit
     (``delta``: changed_since of the push), cut down to those lines and ``context`` lines of their
     hunk on each side. A hunk without such a line is left out, a longer unchanged run inside a hunk
     becomes one "... N lines left out ..." line, and a "~" line names a change of the push that left
-    no line to mark (_delta_section), so that none passes unseen.
+    no line to mark, so that none passes unseen. ``then_text`` is the PR's diff of the same files at
+    the last reviewed commit: a hunk that removes lines is left out or cut down only when an earlier
+    round read exactly that hunk (_delta_section).
 
     A further round used to read the whole section of every file the push touched, and a file that
     is new in the PR is one hunk: a fix of a few lines had the model read, and report on, hundreds
     of lines an earlier round had reviewed. The raw diff that `post` places findings on stays whole."""
-    out = []
-    for path, text in split_sections(diff_text):
-        out += _delta_section(text, delta.get(path) if path else None, context)
-    return "\n".join(out) + ("\n" if out else "")
+    return _delta_view(diff_text, delta, then_text, context)[0]
 
 
 def read_findings(result: dict) -> dict:
@@ -1629,6 +1690,12 @@ def _cmd_interdiff(args) -> int:
     events_now = parse_name_status(_git(["diff", "--name-status", "-M", f"{base}...{head}"]))
     meta = {"last_sha": last, "fallback": fallback, "changed": result.changed, "unchanged": result.unchanged,
             "reverted": result.reverted}
+    # The PR's diff of the changed files as the round at `last` read it ("" without such a round):
+    # number_delta leaves a hunk that removes lines out, or cuts it down, only when it finds it here.
+    reviewed_sections = ""
+    if last and not fallback:
+        reviewed_sections = "".join(text for path, text in split_sections(then) if path in set(result.changed))
+    (out_dir / "interdiff.then.diff").write_text(reviewed_sections, encoding="utf-8")
     if last and not fallback:
         numstat = _git(["diff", "--numstat", last, head, "--", *result.changed]) if result.changed else ""
         paths_then = {path for event in parse_name_status(_git(["diff", "--name-status", "-M", f"{base}...{last}"]))
@@ -1724,12 +1791,20 @@ def _cmd_review(args) -> int:
     numbered_path = diff_path.with_name(diff_path.name + ".numbered")
     # A further round reads the push: the lines changed since the last reviewed commit, with context.
     cut_down = args.diff_source == "interdiff" and has_delta(meta)
-    numbered = number_delta(diff_text, meta["delta"]) if cut_down else number_diff(diff_text)
-    numbered_path.write_text(numbered, encoding="utf-8")
     reads = f"model reads {numbered_path.as_posix()}"
     if cut_down:
-        reads += (f": {len(git_lines(numbered))} lines, {sum(line.startswith('>') for line in git_lines(numbered))} "
-                  "line(s) changed since the last reviewed commit")
+        # The PR's diff of these files at the reviewed commit. Without it no hunk that removes lines
+        # counts as read before, so each one is shown whole.
+        then_path = interdiff_dir / "interdiff.then.diff"
+        then_text = then_path.read_text(encoding="utf-8") if then_path.exists() else ""
+        numbered, cut = _delta_view(diff_text, meta["delta"], then_text)
+        # How much was cut away and how much could not be, so the saving can be read from a run.
+        reads += (f": {len(git_lines(numbered))} lines, {cut['marked']} line(s) changed since the last reviewed "
+                  f"commit, {cut['notes']} note(s), {cut['hunks_left_out']} hunk(s) left out, {cut['whole']} file(s) "
+                  "shown whole")
+    else:
+        numbered = number_diff(diff_text)
+    numbered_path.write_text(numbered, encoding="utf-8")
     print(f"[claude-review] round {args.round} ({args.mode}), diff source {args.diff_source}: "
           f"{len(git_lines(diff_text))} lines -> {diff_path.as_posix()} ({reads}); "
           f"{len(dropped)} ignored file(s) left out" + (f": {', '.join(dropped[:10])}" if dropped else "")

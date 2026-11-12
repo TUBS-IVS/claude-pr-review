@@ -16,15 +16,19 @@ of the deep one).
   The reviewed commit is now the complete round whose commit is the newest ancestor of head, stale or not.
 - A further round reads the push, not the whole section of every file the push touched: its diff is cut down to the
   lines changed since the last reviewed commit, marked `>`, with 30 lines of context; unchanged hunks are left out.
-  The prompt paragraph `{{DIFF_BLOCK}}` explains the marks, so no prompt file needs a change. Findings are still
-  placed on the whole sections.
+  No change of the push is hidden by the cut: what leaves no line to mark (removed lines, a part of the PR's change
+  that was taken back) is named in a `~` line, and a hunk that removes lines is left out only when an earlier round
+  read exactly that hunk, so a merge of the base branch that changes what the PR replaces is shown. The prompt
+  paragraph `{{DIFF_BLOCK}}` explains the marks, so no prompt file needs a change. Findings are still placed on the
+  whole sections, and the review step's log line says how much was cut away.
 - New optional config key `supporting_paths` (documentation, tests): changed lines and files in these paths do not
   count towards the deep tier's size thresholds (`deep_min_lines`, `deep_min_files`). They still count for the full
   tier, the structure rules are unchanged, and the model still reads them. TUBS-IVS/eqasim-bs PR #553, 25 lines of
   code and 1119 lines of documentation, was a deep review.
 - New optional key `rereview.small_push_lines`: a push of at most that many changed lines, without a structure
   change, is only checked. It runs on `rereview.verify_tier` instead of the tier the first-round rules give it (nearly
-  all code is a critical path, so every fix was a full review), and never on a higher tier than they give.
+  all code is a critical path, so every fix was a full review), and never on a higher tier than they give. A push
+  that takes a file out of the PR or changes a binary file is never small.
 - New optional key `rereview.verify_effort`: the effort of every check, that is of the verify rounds and of small
   pushes. Without it a check runs at the effort of its tier, as every run did.
 - The gate decides the effort of a run (new output `effort` of the gate job, passed to `review` and `outcome`); the

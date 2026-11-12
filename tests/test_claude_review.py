@@ -795,12 +795,18 @@ def test_changed_since_reads_what_a_push_changed_per_file():
                                        "notes.md": [[2, 1, 0]]}
 
 
+# The PR's diff of a.py as it is now, and as it was at the last reviewed commit: its line 12 read
+# "added = 2" then, the second hunk is the same then and now, and docs/gone.md was no part of the PR yet.
+_A_NOW = _DIFF.split("diff --git a/docs/gone.md")[0]
+_A_BEFORE = _A_NOW.replace("+    added = 3", "+    added = 2")
+
+
 def test_a_further_round_shows_the_model_what_changed_since_the_last_round():
     # TUBS-IVS/eqasim-bs, 2026-11: a further round re-read the whole section of every file the push
     # touched, and a file that is new in the PR is one hunk, so a fix of a few lines had the model read
     # (and comment on) hundreds of lines it had already reviewed. Here the push made line 12 of a.py
-    # and deleted docs/gone.md; a.py's second hunk and the rest of its first one were reviewed before.
-    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[12, 1, 1]], "docs/gone.md": [[0, 0, 2]]})
+    # and deleted docs/gone.md; a.py's second hunk was reviewed before as it is.
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[12, 1, 1]], "docs/gone.md": [[0, 0, 2]]}, _A_BEFORE)
     assert view.split("\n") == [
         "        |diff --git a/braunschweig/a.py b/braunschweig/a.py",
         "        |index 1111111..2222222 100644",
@@ -828,11 +834,13 @@ def test_a_further_round_shows_the_model_what_changed_since_the_last_round():
 
 _NEW_FILE = ("diff --git a/braunschweig/n.py b/braunschweig/n.py\nnew file mode 100644\n--- /dev/null\n"
              "+++ b/braunschweig/n.py\n@@ -0,0 +1,14 @@\n" + "".join(f"+l{i}\n" for i in range(1, 15)))
+_NEW_FILE_BEFORE = _NEW_FILE.replace("+l7\n", "+was7\n")
 
 
 def test_a_long_hunk_is_cut_down_to_the_lines_around_a_change():
     # A file that is new in the PR is a single hunk: line 7 changed, two lines of context on each side.
-    assert cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[7, 1, 1]]}, context=2).split("\n")[4:] == [
+    view = cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[7, 1, 1]]}, _NEW_FILE_BEFORE, context=2)
+    assert view.split("\n")[4:] == [
         "        |@@ -0,0 +1,14 @@",
         "        |... 4 lines left out: unchanged since the last reviewed commit (lines 1-4 of the file) ...",
         "      5 |+l5",
@@ -843,53 +851,114 @@ def test_a_long_hunk_is_cut_down_to_the_lines_around_a_change():
         "        |... 5 lines left out: unchanged since the last reviewed commit (lines 10-14 of the file) ...",
         ""]
     # a gap of up to three lines between two changes is shown: a placeholder would save nothing
-    view = cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[3, 1, 1], [11, 1, 1]]}, context=2)
+    view = cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[3, 1, 1], [11, 1, 1]]}, _NEW_FILE_BEFORE, context=2)
     assert [line[1:7].strip() for line in view.splitlines()[5:]] == [str(n) for n in range(1, 15)]
     assert view.splitlines()[-1] == "     14 |+l14"            # the short tail is shown too
     # with the default context the whole of this short file is shown, the changed line marked
-    assert [line[:1] for line in cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[7, 1, 1]]}).splitlines()[5:]] == \
-        [" "] * 6 + [">"] + [" "] * 7
+    view = cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[7, 1, 1]]}, _NEW_FILE_BEFORE)
+    assert [line[:1] for line in view.splitlines()[5:]] == [" "] * 6 + [">"] + [" "] * 7
 
 
 def test_lines_removed_since_the_last_round_are_named_where_they_stood():
     # The push removed two lines the PR had added after line 11: they leave no trace in the PR's diff.
-    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[11, 0, 2]]}).splitlines()
+    before = (_A_NOW.replace("+    new = 2\n", "+    new = 2\n+    gone = 1\n+    gone = 2\n")
+              .replace("@@ -10,3 +10,4 @@", "@@ -10,3 +10,6 @@"))
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[11, 0, 2]]}, before).splitlines()
     assert view[5:10] == [
         "     10 |     keep = 1",
         "        |-    old = 2",
         "     11 |+    new = 2",
         "        |~ lines were removed here since the last reviewed commit",
         "     12 |+    added = 3"]
-    # ... a removed line of the base branch shows as a deleted line of the PR's diff, and is marked
-    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[10, 0, 1]]}).splitlines()
+    # ... at the end of a hunk the note follows the line they stood after
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[13, 0, 2]]}, _A_BEFORE).splitlines()
+    assert view[9:11] == ["     13 |     tail = 4", "        |~ lines were removed here since the last reviewed commit"]
+    # ... a line of the base branch that the push removed is a deleted line of the PR's diff, and is marked
+    before = _A_NOW.replace("-    old = 2\n", "     old = 2\n").replace("@@ -10,3 +10,4 @@", "@@ -10,3 +10,5 @@")
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[10, 0, 1]]}, before).splitlines()
     assert view[5:8] == ["     10 |     keep = 1", ">       |-    old = 2", "     11 |+    new = 2"]
+    # ... and where the push replaced a line, the deleted lines right before it are marked with it: git
+    # does not say which of them the push removed (here the deletion was there before)
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[11, 1, 1]]}, _A_BEFORE).splitlines()
+    assert view[5:8] == ["     10 |     keep = 1", ">       |-    old = 2", ">    11 |+    new = 2"]
 
 
 def test_no_change_of_a_push_is_invisible_in_the_cut_down_diff():
     # Whatever the push changed must leave a trace, or a part of the PR's change that was taken back
     # (the code that used it may still be there) would pass unseen. A changed line that is a context
     # line of the PR's diff now, i.e. as on the base branch again, is marked like an added one ...
-    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[13, 1, 1]]}).splitlines()
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[13, 1, 1]]}, _A_BEFORE).splitlines()
     assert view[8:10] == ["     12 |+    added = 3", ">    13 |     tail = 4"]
     # ... and changes where the PR's diff has no hunk any more are named once, by their lines
-    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[12, 1, 1], [25, 0, 3], [300, 2, 2]]}).splitlines()
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[12, 1, 1], [25, 0, 3], [300, 2, 2]]}, _A_BEFORE).splitlines()
     assert view[4] == ("        |~ since the last reviewed commit this file also changed at line 25, 300, where it is as on "
                        "the base branch now (a change of the base branch, or a part of the PR's change that was taken "
                        "back): open the file to see it")
     assert view[5] == "        |@@ -10,3 +10,4 @@ def f():" and view[9] == ">    12 |+    added = 3"
     # ... also when nothing else of the file is left to show
-    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[25, 0, 3]]}).splitlines()
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[25, 0, 3]]}, _A_NOW).splitlines()
     assert view[4].startswith("        |~ since the last reviewed commit this file also changed at line 25, where")
     assert view[5] == "        |... 2 hunks left out: unchanged since the last reviewed commit ..."
+    # ... a removal at the top of the file is named by the file's first line, a line that exists
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[0, 0, 3]]}, _A_NOW).splitlines()
+    assert view[4].startswith("        |~ since the last reviewed commit this file also changed at line 1, where")
     # more than ten such places are counted, not listed
     far = [[100 * n, 1, 1] for n in range(1, 14)]
     assert "at line 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 (+3 more), where" in \
-        cr.number_delta(_DIFF, {"braunschweig/a.py": far}).splitlines()[4]
+        cr.number_delta(_A_NOW, {"braunschweig/a.py": far}, _A_NOW).splitlines()[4]
+
+
+def test_a_change_that_reaches_past_the_edge_of_a_hunk_is_named_too():
+    # Review finding on this change: the push changed lines 12 to 20 back to the base branch's text.
+    # 12 to 14 are context lines of the PR's hunk now and are marked; 15 to 20 lie outside it, and
+    # were neither marked nor named.
+    now = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -7,8 +7,8 @@\n"
+           " c7\n c8\n c9\n-o10\n-o11\n+n10\n+n11\n c12\n c13\n c14\n")
+    before = now.replace(" c12\n", "-o12\n+n12\n")
+    view = cr.number_delta(now, {"a.py": [[12, 9, 9]]}, before).splitlines()
+    assert view[3].startswith("        |~ since the last reviewed commit this file also changed at line 15, where")
+    assert view[5:] == ["      7 | c7", "      8 | c8", "      9 | c9", "        |-o10", "        |-o11", "     10 |+n10",
+                        "     11 |+n11", ">    12 | c12", ">    13 | c13", ">    14 | c14"]
+
+
+_MERGED_BEFORE = "diff --git a/c.py b/c.py\n--- a/c.py\n+++ b/c.py\n@@ -1,3 +1,3 @@\n a = 1\n-x = 1\n+x = 2\n b = 3\n"
+
+
+def test_a_hunk_that_the_base_branch_changed_under_the_pr_is_shown():
+    # Review finding on this change. The PR sets x = 2 where main had x = 1; main then sets x = 0 (and
+    # changes line 50), and the merge keeps the PR's value. No line of the hunk changed at head, but
+    # what the PR does there did: it now overrides main's new value. The hunk was left out as unchanged.
+    now = _MERGED_BEFORE.replace("-x = 1", "-x = 0")
+    view = cr.number_delta(now, {"c.py": [[50, 1, 1]]}, _MERGED_BEFORE).splitlines()
+    assert view[3].startswith("        |~ since the last reviewed commit this file also changed at line 50, where")
+    assert view[4:] == ["        |@@ -1,3 +1,3 @@", "      1 | a = 1", ">       |-x = 0", "      2 |+x = 2", "      3 | b = 3"]
+    # Main itself removed one of the two lines the PR removed: no line is left to mark, so the hunk says so.
+    before = _MERGED_BEFORE.replace("-x = 1\n", "-gone\n-x = 1\n").replace("@@ -1,3 +1,3 @@", "@@ -1,4 +1,3 @@")
+    view = cr.number_delta(_MERGED_BEFORE, {"c.py": [[50, 1, 1]]}, before).splitlines()
+    assert view[4:] == [
+        "        |@@ -1,3 +1,3 @@",
+        "        |~ this hunk is not as an earlier round reviewed it, although no line of it changed at head: the "
+        "base branch changed under it",
+        "      1 | a = 1", "        |-x = 1", "      2 |+x = 2", "      3 | b = 3"]
+    # ... while the same hunk, reviewed before as it is, is left out
+    view = cr.number_delta(_MERGED_BEFORE, {"c.py": [[50, 1, 1]]}, _MERGED_BEFORE).splitlines()
+    assert view[4:] == ["        |... 1 hunk left out: unchanged since the last reviewed commit ..."]
+
+
+def test_a_changed_hunk_that_deletes_lines_is_never_cut_down():
+    # What a hunk deletes can change without a changed line at head (the test above), and nothing says
+    # where: a hunk with deleted lines that differs from the reviewed one is shown whole.
+    now = ("diff --git a/d.py b/d.py\n--- a/d.py\n+++ b/d.py\n@@ -1,13 +1,13 @@\n-old\n+new\n"
+           + "".join(f" c{i}\n" for i in range(2, 14)))
+    view = cr.number_delta(now, {"d.py": [[1, 1, 1]]}, now.replace("+new", "+was"), context=2)
+    assert "left out" not in view and view.splitlines()[-1] == "     13 | c13"
+    # ... also when the file was not in the PR's diff at the last reviewed commit at all
+    assert "left out" not in cr.number_delta(now, {"d.py": [[1, 1, 1]]}, "", context=2)
 
 
 def test_a_file_without_a_changed_line_is_shown_whole():
     # A binary file, a mode change: git names no changed line, so nothing can be cut away.
-    view = cr.number_delta(_THEN, {"braunschweig/a.py": [[12, 1, 1]]}).splitlines()
+    view = cr.number_delta(_THEN, {"braunschweig/a.py": [[12, 1, 1]]}, _THEN).splitlines()
     assert view[-7:] == [
         "        |diff --git a/braunschweig/b.py b/braunschweig/b.py",
         "        |--- a/braunschweig/b.py",
@@ -902,7 +971,9 @@ def test_a_file_without_a_changed_line_is_shown_whole():
 
 def test_the_prompt_of_a_further_round_explains_the_marks():
     block = cr.diff_block("interdiff", "d.numbered", ["braunschweig/a.py"], [], delta=True)
-    assert "starts with `>`" in block and "`~`" in block and "left out" in block and "braunschweig/a.py" in block
+    assert "starts with `>`" in block and "braunschweig/a.py" in block
+    # every kind of line that number_delta adds is explained: the notes and both placeholders
+    assert "starts with `~`" in block and "lines left out" in block and "hunks left out" in block
     # a defect of high severity is reported wherever the model sees it: the cut-down diff saves reading, not safety
     assert "unless a marked change makes it wrong or the defect is of high severity" in block
     template = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8")
@@ -910,8 +981,22 @@ def test_the_prompt_of_a_further_round_explains_the_marks():
     prompt = cr.review_prompt(template, "o/r", 7, "light", "abc123", "interdiff", "d.numbered", meta,
                               cr.empty_state(), "rereview", 2, "T", "body")
     assert "starts with `>`" in prompt
-    # the whole diff of a first round has no marks, and its prompt names none
-    assert "`>`" not in cr.diff_block("pr", "d.numbered", [], [])
+    # No marks are promised where the file has none: an interdiff without the push's lines, and the
+    # whole diff of a first, a forced or a rebased round, also when `interdiff` recorded the push.
+    plain = cr.review_prompt(template, "o/r", 7, "light", "abc123", "interdiff", "d.numbered",
+                             {"changed": ["braunschweig/a.py"], "reverted": []}, cr.empty_state(), "rereview", 2, "T", "body")
+    assert "`>`" not in plain and "braunschweig/a.py" in plain
+    whole = cr.review_prompt(template, "o/r", 7, "deep", "abc123", "pr", "d.numbered", meta, cr.empty_state(), "forced",
+                             2, "T", "body")
+    assert "`>`" not in whole and "The complete diff of the PR" in whole
+
+
+def test_a_file_that_left_the_pr_is_named_with_what_to_check():
+    # Review finding on this change: the PR added a helper, the push deleted it again, and the line
+    # that imports it sits in a hunk that did not change, which the cut-down diff leaves out.
+    for source in ("interdiff", "none"):
+        block = cr.diff_block(source, "d", ["x.py"], ["braunschweig/helper.py"], delta=True)
+        assert "braunschweig/helper.py" in block and "still relies on what they held" in block
 
 
 def test_interdiff_cli_records_what_the_push_changed(tmp_path, monkeypatch):
@@ -944,21 +1029,25 @@ def test_interdiff_cli_records_what_the_push_changed(tmp_path, monkeypatch):
     # the push itself, from the reviewed commit to head, for the files whose change differs
     assert asked == [["diff", "-U0", last, head, "--", "braunschweig/a.py"]]
     assert meta["delta"]["braunschweig/a.py"] == [[12, 2, 1], [32, 0, 2]]
+    # ... and the PR's diff of those files as the earlier round read it: b.py did not change, so it is not in it
+    assert (out_dir / "interdiff.then.diff").read_text(encoding="utf-8") == _THEN.split("diff --git a/braunschweig/b.py")[0]
     # a first round has no reviewed commit to compare with, and says so by having no delta
     state_path.write_text(json.dumps(cr.empty_state()), encoding="utf-8")
     assert cr.main(["interdiff", "--config", str(_CONFIG_PATH), "--state", str(state_path),
                     "--base-sha", base, "--head-sha", head, "--out-dir", str(out_dir)]) == 0
     assert "delta" not in json.loads((out_dir / "interdiff.json").read_text(encoding="utf-8"))
+    assert (out_dir / "interdiff.then.diff").read_text(encoding="utf-8") == ""
 
 
-def test_the_review_of_a_further_round_reads_the_cut_down_diff_and_posts_on_the_whole_one(tmp_path, monkeypatch, capsys):
+def _review_of_a_further_round(tmp_path, monkeypatch, meta, source="interdiff", mode="rereview"):
+    """Run `review` on a.py and docs/gone.md with the model call captured; returns the command line,
+    the interdiff directory and what was captured."""
     (tmp_path / "state.json").write_text(json.dumps(_state_with_open()), encoding="utf-8")
     idir = tmp_path / "idiff"
     idir.mkdir()
     (idir / "interdiff.diff").write_text(_DIFF, encoding="utf-8")
-    (idir / "interdiff.json").write_text(json.dumps({
-        "last_sha": "c" * 40, "fallback": "", "changed": ["braunschweig/a.py", "docs/gone.md"], "unchanged": [],
-        "reverted": [], "delta": {"braunschweig/a.py": [[12, 1, 1]], "docs/gone.md": [[0, 0, 2]]}}), encoding="utf-8")
+    (idir / "interdiff.then.diff").write_text(_A_BEFORE, encoding="utf-8")
+    (idir / "interdiff.json").write_text(json.dumps(meta), encoding="utf-8")
     seen = {}
 
     class Done:
@@ -970,19 +1059,54 @@ def test_the_review_of_a_further_round_reads_the_cut_down_diff_and_posts_on_the_
 
     monkeypatch.setattr(cr.subprocess, "run", fake_run)
     monkeypatch.setattr(cr, "_pr_description", lambda repo, pr: ("T", "body"))
+    monkeypatch.setattr(cr, "_pr_diff", lambda repo, pr, base_sha="", head_sha="": _DIFF)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
     monkeypatch.setenv(cr.BUDGETS_ENV, _BUDGETS)
     monkeypatch.chdir(_CALLER)
-    diff_out = tmp_path / "review-pr.diff"
-    assert cr.main(["review", "--config", str(_CONFIG_PATH), "--tier", "light", "--diff-out", str(diff_out),
-                    "--repo", "o/r", "--pr", "5", "--sha", "d" * 40, "--out", str(tmp_path / "result.json"),
-                    "--state", str(tmp_path / "state.json"), "--interdiff-dir", str(idir),
-                    "--diff-source", "interdiff", "--mode", "rereview", "--round", "2"]) == 0
+    command = ["review", "--config", str(_CONFIG_PATH), "--tier", "light", "--diff-out", str(tmp_path / "review-pr.diff"),
+               "--repo", "o/r", "--pr", "5", "--sha", "d" * 40, "--out", str(tmp_path / "result.json"),
+               "--state", str(tmp_path / "state.json"), "--interdiff-dir", str(idir),
+               "--diff-source", source, "--mode", mode, "--round", "2"]
+    return command, idir, seen
+
+
+_META_WITH_DELTA = {"last_sha": "c" * 40, "fallback": "", "changed": ["braunschweig/a.py", "docs/gone.md"],
+                    "unchanged": [], "reverted": [],
+                    "delta": {"braunschweig/a.py": [[12, 1, 1]], "docs/gone.md": [[0, 0, 2]]}}
+
+
+def test_the_review_of_a_further_round_reads_the_cut_down_diff_and_posts_on_the_whole_one(tmp_path, monkeypatch, capsys):
+    command, idir, seen = _review_of_a_further_round(tmp_path, monkeypatch, _META_WITH_DELTA)
+    assert cr.main(command) == 0
     numbered = (tmp_path / "review-pr.diff.numbered").read_text(encoding="utf-8")
     assert ">    12 |+    added = 3" in numbered and "1 hunk left out" in numbered and "x = 2" not in numbered
-    assert diff_out.read_text(encoding="utf-8") == _DIFF          # `post` places findings on the whole sections
+    assert (tmp_path / "review-pr.diff").read_text(encoding="utf-8") == _DIFF   # `post` places findings on the whole sections
     assert "starts with `>`" in seen["prompt"]
-    assert "3 line(s) changed since the last reviewed commit" in capsys.readouterr().out
+    # the log says how much was cut away and how much could not be, so the saving can be read from a run
+    assert ("18 lines, 3 line(s) changed since the last reviewed commit, 0 note(s), 1 hunk(s) left out, "
+            "0 file(s) shown whole") in capsys.readouterr().out
+    # Without the PR's diff at the reviewed commit nothing proves a hunk with deleted lines unchanged: it is shown.
+    (idir / "interdiff.then.diff").unlink()
+    assert cr.main(command) == 0
+    numbered = (tmp_path / "review-pr.diff.numbered").read_text(encoding="utf-8")
+    assert "x = 2" in numbered and "left out" not in numbered
+
+
+def test_only_a_round_that_starts_from_a_reviewed_commit_reads_a_cut_down_diff(tmp_path, monkeypatch):
+    # A forced round reads the whole PR again although `interdiff` recorded the push ...
+    command, idir, seen = _review_of_a_further_round(tmp_path, monkeypatch, _META_WITH_DELTA, source="pr", mode="forced")
+    assert cr.main(command) == 0
+    numbered = (tmp_path / "review-pr.diff.numbered").read_text(encoding="utf-8")
+    assert numbered.splitlines()[0] == "       |diff --git a/braunschweig/a.py b/braunschweig/a.py"
+    assert "    41 |+    x = 2" in numbered and "left out" not in numbered and "`>`" not in seen["prompt"]
+    # ... and an interdiff without the lines of the push is read whole, with the paragraph that fits it
+    (idir / "interdiff.json").write_text(json.dumps({k: v for k, v in _META_WITH_DELTA.items() if k != "delta"}),
+                                         encoding="utf-8")
+    command[command.index("--diff-source") + 1] = "interdiff"
+    assert cr.main(command) == 0
+    numbered = (tmp_path / "review-pr.diff.numbered").read_text(encoding="utf-8")
+    assert numbered.splitlines()[0] == "       |diff --git a/braunschweig/a.py b/braunschweig/a.py"
+    assert "    41 |+    x = 2" in numbered and "left out" not in numbered and "`>`" not in seen["prompt"]
 
 
 def test_a_line_separator_inside_a_source_line_does_not_shift_the_hunk_counts():
@@ -1375,6 +1499,30 @@ def test_a_small_push_never_runs_on_a_higher_tier_than_the_rules_give_it():
     assert (decision.tier, decision.effort) == ("light", "low")
     decision = cr.classify(config, *_PUSH, context=_ctx(changed=[("matsim/runtime/r.py", 12)]))
     assert (decision.tier, decision.effort) == ("full", "low")
+
+
+def test_a_push_that_takes_a_file_out_of_the_pr_or_changes_a_binary_file_is_no_small_push():
+    # Review finding on this change: a file that left the PR's diff counts no lines. The PR adds a
+    # helper of 400 lines; the push deletes it again and edits two other lines: "4 changed lines", so
+    # a check on the verify tier, although what the helper held may still be used.
+    took_back = _ctx(changed=[("braunschweig/x.py", 4)], reverted=["braunschweig/helper.py"])
+    decision = cr.classify(_SMALL_PUSH, *_PUSH, context=took_back)
+    assert (decision.tier, decision.effort) == ("full", "xhigh"), decision.reason
+    # A binary file has no countable lines: its change is of unknown size, not small, at any limit.
+    for limit in (0, 60):
+        config = _checks_config(small_push_lines=limit, verify_effort="low")
+        decision = cr.classify(config, *_PUSH, context=_ctx(changed=[("data/input.gpkg", 0), ("braunschweig/x.py", 4)]))
+        assert (decision.tier, decision.effort) == ("full", "xhigh"), decision.reason
+    # ... but an ignored file without countable lines does not stand in the way of a check
+    decision = cr.classify(_SMALL_PUSH, *_PUSH, context=_ctx(changed=[("docs/generated/fig.png", 0), ("braunschweig/x.py", 4)]))
+    assert (decision.tier, decision.effort) == ("light", "low"), decision.reason
+
+
+def test_a_small_push_the_rules_would_not_review_is_not_reviewed_either():
+    # A docs/ branch without a critical path and without open findings gets no run, small push or not.
+    decision = cr.classify(_SMALL_PUSH, [("braunschweig/x.py", 400)], "docs/x", [], False, "synchronize", "",
+                           context=_ctx(changed=[("docs/codebase/notes/n.md", 12)]))
+    assert (decision.tier, decision.run, decision.effort) == ("none", False, "")
 
 
 def test_the_keys_of_a_check_are_optional_and_validated():

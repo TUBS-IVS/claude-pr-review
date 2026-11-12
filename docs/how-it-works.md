@@ -128,8 +128,9 @@ open PR still holds and the next write of the comment no longer shows it.
 `state.json`. `interdiff --config --state --base-sha --head-sha --out-dir` compares `git diff base...last` and
 `git diff base...head` per file section (`split_sections`; `index` lines and hunk numbers are normalised away, so a
 merge of the base branch shifts nothing) and writes `interdiff.diff`, `.numstat` and `.json` (changed, unchanged and
-reverted paths; a renamed file is changed; `delta`, the lines the push itself changed, see "The review run and the
-posting"). `classify` takes `--state`, `--interdiff-json`, `--interdiff-numstat`.
+reverted paths; a renamed file is changed; `delta`, the lines the push itself changed) and `interdiff.then.diff` (the
+PR's diff of the changed files at `last`); for the last two see "The review run and the posting". `classify` takes
+`--state`, `--interdiff-json`, `--interdiff-numstat`.
 
 **The reviewed commit.** `last` is, of the rounds with `complete: true`, the one whose commit is the newest ancestor
 of head, by the number of commits between them (`reviewed_commit`, `git rev-list --count`). The history decides,
@@ -153,7 +154,9 @@ of ignored files alone gets no run, like a merge of the base branch, since it ca
 `rereview.small_push_lines` changed lines (optional; without the key this rule is off) and without a structure change
 is only checked: it runs on `rereview.verify_tier` instead of the tier the thresholds and paths give it, and never on
 a higher tier than they give. Nearly all code of a repository is a critical path, so without this rule a fix of a few
-lines is a full review. A structure change
+lines is a full review. A push is never small when it takes a file out of the PR (`reverted`: what the file held may
+still be used) or changes a file without countable lines (a binary file): its lines do not say how much it changes.
+A structure change
 of a further round is a file added, deleted or renamed against the base at head that was not so at the last complete
 round (`interdiff` writes these as `events` in `interdiff.json`), so a file added in round 1 does not make every later
 round deep. The `skip_kinds` rule applies as in the first round.
@@ -245,16 +248,26 @@ the free `classify` job; suppressing them in the caller would copy the label nam
   `changed_since` of `git diff -U0 last head` for the changed files), and `number_delta` cuts the numbered diff down
   to them: a `>` in front marks every line that is new or changed since `last`, `DELTA_CONTEXT` lines of its hunk
   stay on each side, a hunk without such a line is left out, and a longer unchanged run becomes one `... N lines left
-  out ...` line. Every change of the push leaves a trace, so that a part of the PR's change that was taken back (the
-  code that used it may still be there) cannot pass unseen: a changed line that is a context line of the PR's diff
-  now is marked like an added one, a `~` line stands where the push removed lines the PR had added, and one `~` line
-  per file names the lines that changed where the PR's diff has no hunk any more (there the file is as on the base
-  branch: a part taken back, or a change of the base branch that a merge brought in). A file of which git names no
-  changed line (binary, mode change) is shown whole. The prompt paragraph `{{DIFF_BLOCK}}` explains the marks and
-  tells the model to report on an unmarked line only when a marked change makes it wrong or the defect is of high
-  severity. The raw diff that `post` places findings on stays the whole sections (`interdiff.diff`), so a finding on
-  a context line is still an inline comment. With `diff_source` `none` there is no diff at all (only open findings
-  to verify). The posting of a further round follows "Rounds".
+  out ...` line. Two rules keep the cut from hiding a change:
+  - Every change of the push leaves a trace, so that a part of the PR's change that was taken back (the code that
+    used it may still be there) cannot pass unseen: a changed line that is a context line of the PR's diff now is
+    marked like an added one, a `~` line stands where the push removed lines the PR had added, and one `~` line per
+    file names the lines that changed where the PR's diff has no hunk any more, also the part of a change that
+    reaches past the edge of a hunk (there the file is as on the base branch: a part taken back, or a change of the
+    base branch that a merge brought in). A file the push took out of the PR is named in the prompt with the request
+    to check what still relies on it.
+  - A hunk that removes lines is left out, or cut down, only when an earlier round read exactly that hunk
+    (`interdiff.then.diff`). What a hunk removes can change without a changed line at head: main changes the line
+    the PR replaces, and the merge keeps the PR's line, which now overrides main's new one. Such a removed line is
+    marked; a hunk in which nothing can be marked says so in a `~` line and is shown whole.
+
+  A file of which git names no changed line (binary, mode change) is shown whole. The prompt paragraph
+  `{{DIFF_BLOCK}}` explains the marks and tells the model to report on an unmarked line only when a marked change
+  makes it wrong or the defect is of high severity. The log line of the review step says how much was cut away and
+  how much could not be (lines, marked lines, notes, hunks left out, files shown whole). The raw diff that `post`
+  places findings on stays the whole sections (`interdiff.diff`), so a finding on a context line is still an inline
+  comment. With `diff_source` `none` there is no diff at all (only open findings to verify). The posting of a further
+  round follows "Rounds".
 - `post --dry-run` prints both payloads and posts nothing, for local tests.
 
 ## Learning from the findings (session retro)
