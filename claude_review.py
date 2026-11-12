@@ -293,6 +293,7 @@ class Decision:
     mode: str = "first"  # "first", "rereview", "verify", "forced" or "none"
     diff_source: str = "pr"  # what the model reads: "pr" (whole PR), "interdiff" or "none"
     round: int = 1
+    effort: str = ""  # the effort level of the run; "" for the model's default
 
 
 @dataclass
@@ -479,11 +480,18 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
         prefix += (f"round {round_number}, {context.automatic_rounds}/{rereview['max_rounds']} automatic rounds used, "
                    f"{context.open_findings} open finding(s), since {context.last_sha[:12]}: ")
 
-    def decide(tier: str, why: str, mode: str, diff_source: str, size: str = measured[3]) -> Decision:
+    def decide(tier: str, why: str, mode: str, diff_source: str, size: str = measured[3],
+               check: bool = False) -> Decision:
         run = tier != "none"
+        # A check (every verify round, and a small push) runs at `rereview.verify_effort` when the
+        # config sets one. Every other run, and a check without that key, runs at the effort of its tier.
+        effort = ""
+        if run:
+            effort = str((rereview.get("verify_effort") if check or mode == "verify" else None)
+                         or tiers[tier].get("effort") or "")
         return Decision(run, tier, tiers[tier]["model"] if run else "", int(tiers[tier]["max_turns"]) if run else 0,
                         f"{prefix}{why} ({size})", measured[0], measured[1], measured[2],
-                        mode if run else "none", diff_source if run else "none", round_number)
+                        mode if run else "none", diff_source if run else "none", round_number, effort)
 
     if label_cfg["skip"] in labels:
         return decide("none", f"skipped: label '{label_cfg['skip']}' is set", "none", "none")
@@ -533,6 +541,17 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
     if tier == "none" and context.open_findings:
         return decide(verify, f"verify: {context.open_findings} open finding(s), the push itself is not reviewed ({why})",
                       "verify", "interdiff")
+    # A small push is a check, not another review: the first-round rules would put nearly every fix
+    # on the full tier, because nearly all code of a repository is a critical path, however few lines
+    # it changes (`rereview.small_push_lines`, optional). A structure change is never small, and the
+    # check never runs on a higher tier than the rules give the push.
+    limit = rereview.get("small_push_lines")
+    if tier != "none" and limit is not None and measured[0] <= int(limit) and not structure[2]:
+        if TIER_NAMES.index(verify) < TIER_NAMES.index(tier):
+            return decide(verify, f"{verify}: a small push (at most {limit} changed lines) is checked on the verify "
+                                  f"tier instead of {why}", "rereview", "interdiff", check=True)
+        return decide(tier, f"{why}, checked as a small push (at most {limit} changed lines)", "rereview", "interdiff",
+                      check=True)
     return decide(tier, why, "rereview", "interdiff")
 
 
@@ -562,7 +581,7 @@ CONFIG_KEYS = {"labels": ("force", "skip"), "skip_drafts": None, "critical_paths
                "rereview": ("max_rounds", "verify_tier"), "tiers": TIER_NAMES,
                "review": ("prompt_file", "allowed_tools")}
 #: Keys a section may have but need not: a caller's config from before the key existed stays valid.
-OPTIONAL_KEYS = {"rereview": ("verify_after_cap",)}
+OPTIONAL_KEYS = {"rereview": ("verify_after_cap", "small_push_lines", "verify_effort")}
 #: Placeholders a prompt must contain: where the diff is, and the open findings of earlier rounds.
 REQUIRED_PLACEHOLDERS = ("DIFF_BLOCK", "ROUND_BLOCK")
 
@@ -688,6 +707,12 @@ def config_problems(config, prompt_template, budgets: str = "") -> list:
         problems.append(f"'rereview.verify_tier' must be one of {', '.join(TIER_NAMES)}, got {rereview['verify_tier']!r}")
     if "verify_after_cap" in rereview and not (_whole(rereview["verify_after_cap"]) and rereview["verify_after_cap"] >= 0):
         problems.append(f"'rereview.verify_after_cap' must be a whole number >= 0, got {rereview['verify_after_cap']!r}")
+    if "small_push_lines" in rereview and not (_whole(rereview["small_push_lines"]) and rereview["small_push_lines"] >= 0):
+        problems.append(f"'rereview.small_push_lines' must be a whole number >= 0, got {rereview['small_push_lines']!r}")
+    if "verify_effort" in rereview and rereview["verify_effort"] not in EFFORT_LEVELS:
+        # As for a tier's effort: the CLI would only warn and run at the default.
+        problems.append(f"'rereview.verify_effort' must be one of {', '.join(EFFORT_LEVELS)}, "
+                        f"got {rereview['verify_effort']!r}")
     review = _mapping(config, "review")
     if "allowed_tools" in review:
         tools = review["allowed_tools"]
@@ -838,11 +863,13 @@ def review_prompt(template: str, repo: str, pr: int, tier: str, sha: str, diff_s
     return build_prompt(template, values, verbatim)
 
 
-def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_usd: float) -> list:
-    """The `claude -p` call of one review run; ``budget_usd`` is the tier's hard budget (tier_budget)."""
-    # The tier's effort level, when the config sets one (check-config has validated it); without
-    # it the CLI applies the model's default.
-    effort = ["--effort", str(tier_cfg["effort"])] if tier_cfg.get("effort") else []
+def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_usd: float, effort: str = "") -> list:
+    """The `claude -p` call of one review run; ``budget_usd`` is the tier's hard budget (tier_budget),
+    ``effort`` the level the gate decided for this run (a check runs at its own)."""
+    # The gate's effort, else the tier's, when the config sets one (check-config has validated both);
+    # without any the CLI applies the model's default.
+    level = effort or tier_cfg.get("effort")
+    effort = ["--effort", str(level)] if level else []
     return [
         claude_bin, "-p",
         # --bare: authenticate strictly with ANTHROPIC_API_KEY (never a Claude plan login, so the
@@ -1334,9 +1361,10 @@ def _cmd_classify(args) -> int:
                         args.event_action or "", args.event_label or "", context, events)
     print(f"[claude-review] {decision.reason}")
     print(f"[claude-review] run={str(decision.run).lower()} tier={decision.tier} model={decision.model or '-'} "
+          f"effort={decision.effort or ('default' if decision.run else '-')} "
           f"mode={decision.mode} diff={decision.diff_source} round={decision.round}")
     _append("GITHUB_OUTPUT", f"run={str(decision.run).lower()}\ntier={decision.tier}\nmodel={decision.model}\n"
-                             f"max_turns={decision.max_turns}\nmode={decision.mode}\n"
+                             f"max_turns={decision.max_turns}\neffort={decision.effort}\nmode={decision.mode}\n"
                              f"diff_source={decision.diff_source}\nround={decision.round}\nreason={decision.reason}\n")
     _append("GITHUB_STEP_SUMMARY", f"### Claude review gate\n\n- Decision: **{decision.tier}** "
                                    f"(round {decision.round}, mode {decision.mode})\n"
@@ -1437,7 +1465,8 @@ def _cmd_outcome(args) -> int:
         print(f"error: no run record: {error}", file=sys.stderr)
         _append("GITHUB_STEP_SUMMARY", f"### Claude review run\n\n**No run record:** {error}\n")
         return 1
-    outcome.update({"tier": args.tier, "model": args.model})
+    # The effort the gate decided ("": the model's default), so the efforts can be tuned from the records.
+    outcome.update({"tier": args.tier, "model": args.model, "effort": args.effort})
     # The configured name and, when it differs, what the CLI called: an alias reads "fable (claude-fable-5-2)".
     used = ", ".join(outcome["models_used"])
     model_text = (args.model or "-") + (f" ({used})" if used and used != args.model else "")
@@ -1448,15 +1477,16 @@ def _cmd_outcome(args) -> int:
     else:
         status = "complete" if outcome["subtype"] == "success" else outcome["subtype"]
     print(f"[claude-review] {status}: tier {args.tier or '-'}, model {model_text}, "
-          f"{outcome['num_turns']} turns, {outcome['duration_s']} s")
+          f"effort {args.effort or 'model default'}, {outcome['num_turns']} turns, {outcome['duration_s']} s")
     if status != "complete":
         print(f"::warning::Claude review did not complete ({status}); the review is partial.")
     if outcome["error_text"]:
         # One line, so the workflow command is not cut at the first newline.
         print(f"::error::Claude run error: {' '.join(outcome['error_text'].split())}")
     _append("GITHUB_STEP_SUMMARY",
-            "### Claude review run\n\n| Status | Tier | Model | Turns | Duration (s) |\n|---|---|---|---|---|\n"
-            f"| {status} | {args.tier or '-'} | {model_text} | {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
+            "### Claude review run\n\n| Status | Tier | Model | Effort | Turns | Duration (s) |\n|---|---|---|---|---|---|\n"
+            f"| {status} | {args.tier or '-'} | {model_text} | {args.effort or 'model default'} "
+            f"| {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
             "Source: the `result` record of the Claude Code execution file.\n"
             + (f"\n**Run error:** `{' '.join(outcome['error_text'].split())}`\n" if outcome["error_text"] else ""))
     if args.json_out:
@@ -1524,9 +1554,11 @@ def _cmd_review(args) -> int:
         print("::error::ANTHROPIC_API_KEY is not set; the review needs a workspace API key.")
         return 1
     budget, source = tier_budget(tier_cfg, args.tier, os.environ.get(BUDGETS_ENV, ""))
-    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"], budget)
+    # The gate's effort for this run (a check runs at its own); the tier's when the gate adds none.
+    effort = args.effort or tier_cfg.get("effort") or ""
+    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"], budget, effort)
     print(f"[claude-review] running claude -p: tier {args.tier}, model {tier_cfg['model']}, "
-          f"effort {tier_cfg.get('effort') or 'model default'}, max {tier_cfg['max_turns']} turns, "
+          f"effort {effort or 'model default'}, max {tier_cfg['max_turns']} turns, "
           f"budget from {source}")
     # The model's process gets no budgets: the model reads files, and what it writes is posted publicly.
     child_env = {key: value for key, value in os.environ.items() if key != BUDGETS_ENV}
@@ -1808,6 +1840,8 @@ def main(argv=None) -> int:
                           help="what the model reads (the gate's diff_source output)")
     p_review.add_argument("--mode", default="first", help="the gate's mode output")
     p_review.add_argument("--round", default=1, type=int, help="the gate's round output")
+    p_review.add_argument("--effort", default="", choices=["", *EFFORT_LEVELS],
+                          help="the gate's effort output; empty: the effort of the tier, else the model's default")
     p_review.add_argument("--claude-bin", default="claude")
     p_review.set_defaults(func=_cmd_review)
 
@@ -1833,6 +1867,7 @@ def main(argv=None) -> int:
     p_outcome.add_argument("--execution-file", required=True)
     p_outcome.add_argument("--tier", default="")
     p_outcome.add_argument("--model", default="")
+    p_outcome.add_argument("--effort", default="", help="the gate's effort output; empty: the model's default")
     p_outcome.add_argument("--json", dest="json_out")
     p_outcome.set_defaults(func=_cmd_outcome)
 

@@ -1071,6 +1071,170 @@ def test_verify_after_cap_is_optional_in_a_callers_config():
                for p in cr.config_problems(config, _PROMPT, budgets=_BUDGETS))
 
 
+def _checks_config(**rereview):
+    """The fixture config with an effort per tier and the given keys for further rounds."""
+    config = copy.deepcopy(CONFIG)
+    for tier, effort in (("light", "high"), ("full", "xhigh"), ("deep", "max")):
+        config["tiers"][tier]["effort"] = effort
+    config["rereview"].update(rereview)
+    return config
+
+
+# A caller that has a small push only checked (both keys optional, new in v1.5.0).
+_SMALL_PUSH = _checks_config(small_push_lines=60, verify_effort="low")
+_PUSH = ([("braunschweig/x.py", 400)], "fix/i1-x", [], False, "synchronize", "")
+
+
+@pytest.mark.parametrize("ctx, tier, mode, effort", [
+    # a fix of a few lines on a critical path is checked on the verify tier, at the effort of a check ...
+    (_ctx(open_=1, changed=[("braunschweig/x.py", 12)]), "light", "rereview", "low"),
+    # ... up to the limit; one line more is a review again, at the effort of its tier
+    (_ctx(open_=1, changed=[("braunschweig/x.py", 60)]), "light", "rereview", "low"),
+    (_ctx(open_=1, changed=[("braunschweig/x.py", 61)]), "full", "rereview", "xhigh"),
+    # many files with a few lines each are still a small push
+    (_ctx(changed=[(f"braunschweig/m{i}.py", 3) for i in range(8)]), "light", "rereview", "low"),
+    # ... but a structure change never is, however small
+    (_ctx(changed=[("synthesis/population/new_stage.py", 30)], events=_ADDED_STAGE), "deep", "rereview", "max"),
+    # a small push that the first-round rules put on the light tier anyway is a check too
+    (_ctx(changed=[("scripts/report_x.py", 12)]), "light", "rereview", "low"),
+    # every verify round is a check: after the cap, for a revert, for a push the rules would not review
+    (_ctx(auto=3, open_=2, changed=[("braunschweig/x.py", 900)]), "light", "verify", "low"),
+    (_ctx(open_=1, changed=[], reverted=["braunschweig/z.py"]), "light", "verify", "low"),
+])
+def test_a_small_push_is_checked_on_the_verify_tier_at_the_effort_of_a_check(ctx, tier, mode, effort):
+    decision = cr.classify(_SMALL_PUSH, *_PUSH, context=ctx)
+    assert (decision.tier, decision.mode, decision.effort) == (tier, mode, effort), decision.reason
+    assert decision.model == _SMALL_PUSH["tiers"][tier]["model"] and decision.diff_source != "pr"
+
+
+def test_the_gate_reason_names_the_small_push_rule_and_the_tier_it_replaced():
+    decision = cr.classify(_SMALL_PUSH, *_PUSH, context=_ctx(open_=1, changed=[("braunschweig/x.py", 12)]))
+    assert ("light: a small push (at most 60 changed lines) is checked on the verify tier instead of "
+            "full: critical path touched (12 changed lines in 1 files") in decision.reason
+
+
+def test_the_small_push_rule_is_for_further_rounds_only():
+    # the first review of a small critical change stays a full review at the effort of its tier
+    decision = cr.classify(_SMALL_PUSH, [("braunschweig/x.py", 12)], "fix/i1-x", [], False)
+    assert (decision.tier, decision.mode, decision.effort) == ("full", "first", "xhigh")
+    # ... and so does the whole PR after a rebase, and a forced review
+    rebased = _ctx(changed=None, fallback="reviewed commit c is not an ancestor of head")
+    decision = cr.classify(_SMALL_PUSH, [("braunschweig/x.py", 12)], "fix/i1-x", [], False, "synchronize", "",
+                           context=rebased)
+    assert (decision.tier, decision.mode, decision.effort) == ("full", "first", "xhigh")
+    decision = cr.classify(_SMALL_PUSH, [("braunschweig/x.py", 12)], "fix/i1-x", ["claude-review"], False, "labeled",
+                           "claude-review", context=_ctx(changed=[("braunschweig/x.py", 12)]))
+    assert (decision.tier, decision.mode, decision.effort) == ("deep", "forced", "max")
+
+
+def test_without_its_keys_a_small_critical_push_is_reviewed_as_before():
+    small = _ctx(open_=1, changed=[("braunschweig/x.py", 12)])
+    # the fixture has neither key and no effort: the full tier, at the model's default effort
+    decision = cr.classify(CONFIG, *_PUSH, context=small)
+    assert (decision.tier, decision.effort) == ("full", "")
+    # the limit without an effort of its own: the verify tier, at that tier's effort
+    decision = cr.classify(_checks_config(small_push_lines=60), *_PUSH, context=small)
+    assert (decision.tier, decision.effort) == ("light", "high")
+    # the effort without the limit: only the verify rounds are checks
+    config = _checks_config(verify_effort="low")
+    decision = cr.classify(config, *_PUSH, context=small)
+    assert (decision.tier, decision.effort) == ("full", "xhigh")
+    decision = cr.classify(config, *_PUSH, context=_ctx(auto=3, open_=1, changed=[("braunschweig/x.py", 12)]))
+    assert (decision.tier, decision.mode, decision.effort) == ("light", "verify", "low")
+
+
+def test_a_small_push_never_runs_on_a_higher_tier_than_the_rules_give_it():
+    # A caller that verifies on the full tier: a small push the rules put on the light tier stays there.
+    config = _checks_config(small_push_lines=60, verify_tier="full", verify_effort="low")
+    decision = cr.classify(config, *_PUSH, context=_ctx(changed=[("scripts/report_x.py", 12)]))
+    assert (decision.tier, decision.effort) == ("light", "low")
+    decision = cr.classify(config, *_PUSH, context=_ctx(changed=[("matsim/runtime/r.py", 12)]))
+    assert (decision.tier, decision.effort) == ("full", "low")
+
+
+def test_the_keys_of_a_check_are_optional_and_validated():
+    assert cr.config_problems(_SMALL_PUSH, _PROMPT, budgets=_BUDGETS) == []
+    assert cr.config_problems(_checks_config(small_push_lines=0), _PROMPT, budgets=_BUDGETS) == []
+
+
+def test_classify_cli_hands_the_effort_to_the_review_job(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "claude-review.yml"
+    config_path.write_text(yaml.safe_dump(_SMALL_PUSH), encoding="utf-8")
+    state = cr.empty_state()
+    state["rounds"].append({"round": 1, "sha": "c" * 40, "tier": "full", "run_id": "1", "automatic": True,
+                            "complete": True, "model_call": True, "findings": 0})
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "interdiff.json").write_text(json.dumps({"last_sha": "c" * 40, "fallback": "", "reverted": [],
+                                                         "changed": ["braunschweig/x.py"], "unchanged": [],
+                                                         "events": []}), encoding="utf-8")
+    (tmp_path / "interdiff.numstat").write_text("9\t3\tbraunschweig/x.py\n", encoding="utf-8")
+    (tmp_path / "numstat.tsv").write_text("300\t10\tbraunschweig/x.py\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "out.txt"))
+    assert cr.main(["classify", "--config", str(config_path), "--numstat", str(tmp_path / "numstat.tsv"),
+                    "--branch", "fix/i1-x", "--event-action", "synchronize", "--state", str(tmp_path / "state.json"),
+                    "--interdiff-json", str(tmp_path / "interdiff.json"),
+                    "--interdiff-numstat", str(tmp_path / "interdiff.numstat")]) == 0
+    values = dict(line.split("=", 1) for line in (tmp_path / "out.txt").read_text(encoding="utf-8").splitlines())
+    assert (values["tier"], values["mode"], values["effort"]) == ("light", "rereview", "low")
+    assert "tier=light" in capsys.readouterr().out.split("effort=low", 1)[0]
+    # every output the workflow declares for the gate job is one the gate writes
+    declared = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))["jobs"]["classify"]["outputs"]
+    assert "effort" in declared and set(declared) <= set(values)
+
+
+def test_the_review_runs_at_the_effort_the_gate_decided(tmp_path, monkeypatch, capsys):
+    # A check on the light tier runs at the effort of a check, not at the light tier's own.
+    config_path = tmp_path / "claude-review.yml"
+    config_path.write_text(yaml.safe_dump(_SMALL_PUSH), encoding="utf-8")
+    (tmp_path / "state.json").write_text(json.dumps(_state_with_open()), encoding="utf-8")
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, "{}", ""
+
+    def fake_run(command, input=None, **kwargs):
+        seen["command"] = command
+        return Done()
+
+    monkeypatch.setattr(cr.subprocess, "run", fake_run)
+    monkeypatch.setattr(cr, "_pr_description", lambda repo, pr: ("T", "body"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv(cr.BUDGETS_ENV, _BUDGETS)
+    monkeypatch.chdir(_CALLER)
+    review = ["review", "--config", str(config_path), "--tier", "light", "--diff-out", str(tmp_path / "review-pr.diff"),
+              "--repo", "o/r", "--pr", "5", "--sha", "d" * 40, "--out", str(tmp_path / "result.json"),
+              "--state", str(tmp_path / "state.json"), "--diff-source", "none", "--mode", "verify", "--round", "2"]
+    assert cr.main(review + ["--effort", "low"]) == 0
+    assert seen["command"][seen["command"].index("--effort") + 1] == "low"
+    assert "effort low" in capsys.readouterr().out
+    # the gate says "" when it has nothing to add (and a local run passes no flag): the tier's effort
+    for flag in (["--effort", ""], []):
+        assert cr.main(review + flag) == 0
+        assert seen["command"][seen["command"].index("--effort") + 1] == "high"
+    # an effort the CLI does not know never reaches it
+    with pytest.raises(SystemExit):
+        cr.main(review + ["--effort", "ultra"])
+
+
+def test_the_run_record_names_the_effort_of_the_run(tmp_path, monkeypatch, capsys):
+    # The efforts are tuned from the run records, so each one says at which effort its run ran.
+    execution = tmp_path / "exec.json"
+    execution.write_text(json.dumps([{"type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
+                                      "duration_ms": 1000}]), encoding="utf-8")
+    out, summary = tmp_path / "run.json", tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    assert cr.main(["outcome", "--execution-file", str(execution), "--tier", "light", "--model", "m",
+                    "--effort", "low", "--json", str(out)]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["effort"] == "low"
+    assert "effort low," in capsys.readouterr().out
+    assert "| Effort |" in summary.read_text(encoding="utf-8") and "| m | low |" in summary.read_text(encoding="utf-8")
+    # no effort from the gate: the model's default applied
+    assert cr.main(["outcome", "--execution-file", str(execution), "--tier", "light", "--model", "m",
+                    "--effort", "", "--json", str(out)]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["effort"] == ""
+    assert "effort model default," in capsys.readouterr().out
+
+
 def test_classify_without_a_context_is_the_first_round():
     decision = cr.classify(CONFIG, [("braunschweig/x.py", 40)], "fix/i1-x", [], False)
     assert (decision.mode, decision.diff_source, decision.round, decision.tier) == ("first", "pr", 1, "full")
@@ -1483,6 +1647,12 @@ def test_the_reusable_workflow_wires_the_gate_and_the_rounds():
     for step in ("review", "post"):
         step_text = review_runs.split(f'"$TOOL" {step} ', 1)[1].split("\n\n", 1)[0]
         assert "--state" in step_text and "--interdiff-dir" in step_text   # post shows the fallback in the summary
+    # The gate decides the effort of the run (a check runs at its own); without this wiring every run
+    # would silently take the effort of its tier, and the run record would not say which it was.
+    assert classify_job["outputs"]["effort"] == "${{ steps.gate.outputs.effort }}"
+    assert review_job["env"]["EFFORT"] == "${{ needs.classify.outputs.effort }}"
+    for step in ("review", "outcome"):
+        assert '--effort "$EFFORT"' in review_runs.split(f'"$TOOL" {step} ', 1)[1].split("\n\n", 1)[0], step
     # A failed review step must still reach `post`, which records the round so it counts against the cap.
     post_step = next(s for s in review_job["steps"] if '"$TOOL" post ' in s.get("run", ""))
     assert post_step.get("if") == "always()"
@@ -1576,6 +1746,9 @@ _PROMPT = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8"
     (lambda c: c["rereview"].update(max_rounds=0), "'rereview.max_rounds' must be a whole number >= 1"),
     (lambda c: c["rereview"].update(verify_after_cap=-1), "'rereview.verify_after_cap' must be a whole number >= 0"),
     (lambda c: c["rereview"].update(verify_after_cap="2"), "'rereview.verify_after_cap' must be a whole number >= 0"),
+    (lambda c: c["rereview"].update(small_push_lines=-1), "'rereview.small_push_lines' must be a whole number >= 0"),
+    (lambda c: c["rereview"].update(small_push_lines="60"), "'rereview.small_push_lines' must be a whole number >= 0"),
+    (lambda c: c["rereview"].update(verify_effort="ultra"), "'rereview.verify_effort' must be one of low, medium, high, xhigh, max"),
     (lambda c: c["labels"].update(skip=c["labels"]["force"]), "must be different labels"),
     (lambda c: c["labels"].update(force=" "), "'labels.force' must be a label name"),
     (lambda c: c["thresholds"].pop("full_min_files"), "'thresholds.full_min_files' is missing"),

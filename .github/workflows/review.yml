@@ -57,6 +57,7 @@ jobs:
       tier: ${{ steps.gate.outputs.tier }}
       model: ${{ steps.gate.outputs.model }}
       max_turns: ${{ steps.gate.outputs.max_turns }}
+      effort: ${{ steps.gate.outputs.effort }}
       mode: ${{ steps.gate.outputs.mode }}
       diff_source: ${{ steps.gate.outputs.diff_source }}
       round: ${{ steps.gate.outputs.round }}
@@ -160,6 +161,8 @@ jobs:
       CONFIG: ${{ inputs.config }}
       TIER: ${{ needs.classify.outputs.tier }}
       MODEL: ${{ needs.classify.outputs.model }}
+      # The effort the gate decided for this run (a check runs at its own); empty: the model's default.
+      EFFORT: ${{ needs.classify.outputs.effort }}
       MODE: ${{ needs.classify.outputs.mode }}
       DIFF_SOURCE: ${{ needs.classify.outputs.diff_source }}
       ROUND: ${{ needs.classify.outputs.round }}
@@ -225,13 +228,13 @@ jobs:
           python "$TOOL" review --config "$CONFIG" \
             --tier "$TIER" --repo "$REPO" --pr "$PR_NUMBER" --sha "$HEAD_SHA" --base-sha "$BASE_SHA" \
             --state "$RUNNER_TEMP/state.json" --interdiff-dir "$RUNNER_TEMP/interdiff" \
-            --diff-source "$DIFF_SOURCE" --mode "$MODE" --round "$ROUND" \
+            --diff-source "$DIFF_SOURCE" --mode "$MODE" --round "$ROUND" --effort "$EFFORT" \
             --out "$RUNNER_TEMP/claude-review-result.json"
       - name: Record how the review run ended
         if: always()
         run: |
           python "$TOOL" outcome --execution-file "$RUNNER_TEMP/claude-review-result.json" \
-            --tier "$TIER" --model "$MODEL" --json claude-review-cost.json
+            --tier "$TIER" --model "$MODEL" --effort "$EFFORT" --json claude-review-cost.json
       # Also after a failed review step: a run that called the model is then recorded as an incomplete
       # round, so it counts against the round cap; without a result the step only says so.
       - name: Post review comments
