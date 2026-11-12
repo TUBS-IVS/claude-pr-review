@@ -760,6 +760,213 @@ def test_number_diff_gives_the_model_new_file_line_numbers_that_post_accepts():
     assert "      |-    old = 2" in numbered               # deleted lines carry no number
 
 
+# What `git diff -U0 <reviewed commit> <head>` prints for a push: a.py's line 12 replaced by two lines
+# and two lines removed after line 30, docs/gone.md deleted, and a line "++ counter" added to notes.md
+# (shown as "+++ counter", which must not be taken for a file header).
+_PUSH_DIFF = """diff --git a/braunschweig/a.py b/braunschweig/a.py
+index 1111111..2222222 100644
+--- a/braunschweig/a.py
++++ b/braunschweig/a.py
+@@ -12 +12,2 @@ def f():
+-    added = 3
++    added = 4
++    more = 5
+@@ -32,2 +32,0 @@ def g():
+-    gone = 1
+-    gone = 2
+diff --git a/docs/gone.md b/docs/gone.md
+deleted file mode 100644
+--- a/docs/gone.md
++++ /dev/null
+@@ -1,2 +0,0 @@
+-a
+-b
+diff --git a/notes.md b/notes.md
+--- a/notes.md
++++ b/notes.md
+@@ -1,0 +2 @@
++++ counter
+"""
+
+
+def test_changed_since_reads_what_a_push_changed_per_file():
+    # per hunk: the first new line, the number of new lines and the number of old lines
+    assert cr.changed_since(_PUSH_DIFF) == {"braunschweig/a.py": [[12, 2, 1], [32, 0, 2]], "docs/gone.md": [[0, 0, 2]],
+                                       "notes.md": [[2, 1, 0]]}
+
+
+def test_a_further_round_shows_the_model_what_changed_since_the_last_round():
+    # TUBS-IVS/eqasim-bs, 2026-11: a further round re-read the whole section of every file the push
+    # touched, and a file that is new in the PR is one hunk, so a fix of a few lines had the model read
+    # (and comment on) hundreds of lines it had already reviewed. Here the push made line 12 of a.py
+    # and deleted docs/gone.md; a.py's second hunk and the rest of its first one were reviewed before.
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[12, 1, 1]], "docs/gone.md": [[0, 0, 2]]})
+    assert view.split("\n") == [
+        "        |diff --git a/braunschweig/a.py b/braunschweig/a.py",
+        "        |index 1111111..2222222 100644",
+        "        |--- a/braunschweig/a.py",
+        "        |+++ b/braunschweig/a.py",
+        "        |@@ -10,3 +10,4 @@ def f():",
+        "     10 |     keep = 1",
+        "        |-    old = 2",
+        "     11 |+    new = 2",
+        ">    12 |+    added = 3",
+        "     13 |     tail = 4",
+        "        |... 1 hunk left out: unchanged since the last reviewed commit ...",
+        "        |diff --git a/docs/gone.md b/docs/gone.md",
+        "        |deleted file mode 100644",
+        "        |--- a/docs/gone.md",
+        "        |+++ /dev/null",
+        "        |@@ -1,2 +0,0 @@",
+        ">       |-a",
+        ">       |-b",
+        ""]
+    # every line number the model can cite is one `post` accepts for an inline comment
+    cited = {int(line[1:7]) for line in view.splitlines() if line[1:7].strip()}
+    assert cited == {10, 11, 12, 13} and cited <= cr.commentable_lines(_DIFF)["braunschweig/a.py"]
+
+
+_NEW_FILE = ("diff --git a/braunschweig/n.py b/braunschweig/n.py\nnew file mode 100644\n--- /dev/null\n"
+             "+++ b/braunschweig/n.py\n@@ -0,0 +1,14 @@\n" + "".join(f"+l{i}\n" for i in range(1, 15)))
+
+
+def test_a_long_hunk_is_cut_down_to_the_lines_around_a_change():
+    # A file that is new in the PR is a single hunk: line 7 changed, two lines of context on each side.
+    assert cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[7, 1, 1]]}, context=2).split("\n")[4:] == [
+        "        |@@ -0,0 +1,14 @@",
+        "        |... 4 lines left out: unchanged since the last reviewed commit (lines 1-4 of the file) ...",
+        "      5 |+l5",
+        "      6 |+l6",
+        ">     7 |+l7",
+        "      8 |+l8",
+        "      9 |+l9",
+        "        |... 5 lines left out: unchanged since the last reviewed commit (lines 10-14 of the file) ...",
+        ""]
+    # a gap of up to three lines between two changes is shown: a placeholder would save nothing
+    view = cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[3, 1, 1], [11, 1, 1]]}, context=2)
+    assert [line[1:7].strip() for line in view.splitlines()[5:]] == [str(n) for n in range(1, 15)]
+    assert view.splitlines()[-1] == "     14 |+l14"            # the short tail is shown too
+    # with the default context the whole of this short file is shown, the changed line marked
+    assert [line[:1] for line in cr.number_delta(_NEW_FILE, {"braunschweig/n.py": [[7, 1, 1]]}).splitlines()[5:]] == \
+        [" "] * 6 + [">"] + [" "] * 7
+
+
+def test_lines_removed_since_the_last_round_are_named_where_they_stood():
+    # The push removed two lines the PR had added after line 11: they leave no trace in the PR's diff.
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[11, 0, 2]]}).splitlines()
+    assert view[5:10] == [
+        "     10 |     keep = 1",
+        "        |-    old = 2",
+        "     11 |+    new = 2",
+        "        |~ lines were removed here since the last reviewed commit",
+        "     12 |+    added = 3"]
+    # ... a removed line of the base branch shows as a deleted line of the PR's diff, and is marked
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[10, 0, 1]]}).splitlines()
+    assert view[5:8] == ["     10 |     keep = 1", ">       |-    old = 2", "     11 |+    new = 2"]
+    # ... and lines removed where the file is as on the base branch again have no hunk to show them in
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[25, 0, 3]]}).splitlines()
+    assert view[4:6] == [
+        "        |~ lines were removed after line 25 since the last reviewed commit; that part of the file is as "
+        "on the base branch again",
+        "        |... 2 hunks left out: unchanged since the last reviewed commit ..."]
+
+
+def test_a_file_without_a_changed_line_is_shown_whole():
+    # A binary file, a mode change: git names no changed line, so nothing can be cut away.
+    view = cr.number_delta(_THEN, {"braunschweig/a.py": [[12, 1, 1]]}).splitlines()
+    assert view[-7:] == [
+        "        |diff --git a/braunschweig/b.py b/braunschweig/b.py",
+        "        |--- a/braunschweig/b.py",
+        "        |+++ b/braunschweig/b.py",
+        "        |~ no changed line of this file is known since the last reviewed commit: its whole section follows",
+        "        |@@ -1 +1 @@",
+        "        |-x",
+        "      1 |+y"]
+
+
+def test_the_prompt_of_a_further_round_explains_the_marks():
+    block = cr.diff_block("interdiff", "d.numbered", ["braunschweig/a.py"], [], delta=True)
+    assert "starts with `>`" in block and "`~`" in block and "left out" in block and "braunschweig/a.py" in block
+    template = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8")
+    meta = {"changed": ["braunschweig/a.py"], "reverted": [], "delta": {"braunschweig/a.py": [[12, 1, 1]]}}
+    prompt = cr.review_prompt(template, "o/r", 7, "light", "abc123", "interdiff", "d.numbered", meta,
+                              cr.empty_state(), "rereview", 2, "T", "body")
+    assert "starts with `>`" in prompt
+    # the whole diff of a first round has no marks, and its prompt names none
+    assert "`>`" not in cr.diff_block("pr", "d.numbered", [], [])
+
+
+def test_interdiff_cli_records_what_the_push_changed(tmp_path, monkeypatch):
+    state = cr.empty_state()
+    state["rounds"].append({"round": 1, "sha": "c" * 40, "tier": "full", "run_id": "1", "automatic": True,
+                            "complete": True, "model_call": True, "findings": 0})
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    base, last, head = "b" * 40, "c" * 40, "d" * 40
+    asked = []
+
+    def fake_git(args):
+        if args[0] == "rev-list":
+            return "1\n"
+        if "-U0" in args:
+            asked.append(args)
+            return _PUSH_DIFF
+        if "--numstat" in args:
+            return "2\t1\tbraunschweig/a.py\n"
+        if "--name-status" in args:
+            return "M\tbraunschweig/a.py\n"
+        return _THEN if args[-1] == f"{base}...{last}" else _THEN.replace("+    added = 3", "+    added = 4")
+
+    monkeypatch.setattr(cr, "_git", fake_git)
+    monkeypatch.setattr(cr, "_is_ancestor", lambda older, newer: True)
+    out_dir = tmp_path / "idiff"
+    assert cr.main(["interdiff", "--config", str(_CONFIG_PATH), "--state", str(state_path),
+                    "--base-sha", base, "--head-sha", head, "--out-dir", str(out_dir)]) == 0
+    meta = json.loads((out_dir / "interdiff.json").read_text(encoding="utf-8"))
+    # the push itself, from the reviewed commit to head, for the files whose change differs
+    assert asked == [["diff", "-U0", last, head, "--", "braunschweig/a.py"]]
+    assert meta["delta"]["braunschweig/a.py"] == [[12, 2, 1], [32, 0, 2]]
+    # a first round has no reviewed commit to compare with, and says so by having no delta
+    state_path.write_text(json.dumps(cr.empty_state()), encoding="utf-8")
+    assert cr.main(["interdiff", "--config", str(_CONFIG_PATH), "--state", str(state_path),
+                    "--base-sha", base, "--head-sha", head, "--out-dir", str(out_dir)]) == 0
+    assert "delta" not in json.loads((out_dir / "interdiff.json").read_text(encoding="utf-8"))
+
+
+def test_the_review_of_a_further_round_reads_the_cut_down_diff_and_posts_on_the_whole_one(tmp_path, monkeypatch, capsys):
+    (tmp_path / "state.json").write_text(json.dumps(_state_with_open()), encoding="utf-8")
+    idir = tmp_path / "idiff"
+    idir.mkdir()
+    (idir / "interdiff.diff").write_text(_DIFF, encoding="utf-8")
+    (idir / "interdiff.json").write_text(json.dumps({
+        "last_sha": "c" * 40, "fallback": "", "changed": ["braunschweig/a.py", "docs/gone.md"], "unchanged": [],
+        "reverted": [], "delta": {"braunschweig/a.py": [[12, 1, 1]], "docs/gone.md": [[0, 0, 2]]}}), encoding="utf-8")
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, "{}", ""
+
+    def fake_run(command, input=None, **kwargs):
+        seen["prompt"] = input
+        return Done()
+
+    monkeypatch.setattr(cr.subprocess, "run", fake_run)
+    monkeypatch.setattr(cr, "_pr_description", lambda repo, pr: ("T", "body"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setenv(cr.BUDGETS_ENV, _BUDGETS)
+    monkeypatch.chdir(_CALLER)
+    diff_out = tmp_path / "review-pr.diff"
+    assert cr.main(["review", "--config", str(_CONFIG_PATH), "--tier", "light", "--diff-out", str(diff_out),
+                    "--repo", "o/r", "--pr", "5", "--sha", "d" * 40, "--out", str(tmp_path / "result.json"),
+                    "--state", str(tmp_path / "state.json"), "--interdiff-dir", str(idir),
+                    "--diff-source", "interdiff", "--mode", "rereview", "--round", "2"]) == 0
+    numbered = (tmp_path / "review-pr.diff.numbered").read_text(encoding="utf-8")
+    assert ">    12 |+    added = 3" in numbered and "1 hunk left out" in numbered and "x = 2" not in numbered
+    assert diff_out.read_text(encoding="utf-8") == _DIFF          # `post` places findings on the whole sections
+    assert "starts with `>`" in seen["prompt"]
+    assert "3 line(s) changed since the last reviewed commit" in capsys.readouterr().out
+
+
 def test_a_line_separator_inside_a_source_line_does_not_shift_the_hunk_counts():
     # str.splitlines() would split "+a b" into two lines and push every later line off by one.
     diff = ("diff --git a/x.md b/x.md\n--- a/x.md\n+++ b/x.md\n@@ -1,1 +1,3 @@\n"

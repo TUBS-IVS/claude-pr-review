@@ -792,11 +792,13 @@ def build_prompt(template: str, values: dict, verbatim: dict | None = None) -> s
     return prompt
 
 
-def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, ignored=()) -> str:
+def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, ignored=(),
+               delta: bool = False) -> str:
     """The prompt paragraph that says what the model reads: the whole PR diff, the files changed
     since the last complete round, or no diff at all (only open findings to verify). ``ignored``
     names the changed files left out of the diff as ignored paths, so an undeclared change to one
-    of them (a regenerated input, say) can still be held against the PR description."""
+    of them (a regenerated input, say) can still be held against the PR description. ``delta``:
+    the diff file is number_delta's, cut down to what changed since the last reviewed commit."""
     reading = ("Read ALL of it with Read, page by page (offset/limit) when it is long, before you conclude. "
                "Left of the `|` every added (`+`) and context (` `) line carries its line number in the NEW "
                "version of the file; deleted (`-`) lines and headers carry none.")
@@ -807,6 +809,17 @@ def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, 
                 f"is declared." if ignored else "")
     if diff_source == "pr":
         return f"The complete diff of the PR is in the file {diff_file}. {reading}{left_out}"
+    if diff_source == "interdiff" and delta:
+        return (f"This is a further round. The file {diff_file} holds the PR's diff against main for only "
+                f"the files whose change differs from the last reviewed commit ({', '.join(changed)}), cut down "
+                "to what changed since then. A line that starts with `>` is new or changed since the last "
+                "reviewed commit. The unmarked lines around it are context that an earlier round reviewed. A "
+                "line whose text starts with `~` says where lines were removed. A line `... N lines left out "
+                "...` stands for an unchanged part, which you can open in the file itself with Read. "
+                f"{reading} Review the changes marked `>` and `~`: whether each one is right, and whether it "
+                "breaks the code around it or code elsewhere. Report nothing about an unmarked line unless a "
+                "marked change makes it wrong. The other files of the PR were reviewed before and did not "
+                f"change.{gone}{left_out}")
     if diff_source == "interdiff":
         return (f"This is a further round. The file {diff_file} holds the PR's diff against main for only "
                 f"the files whose change differs from the last reviewed commit: {', '.join(changed)}. "
@@ -841,6 +854,12 @@ def round_block(state: dict, mode: str, round_number: int, moved: bool = False) 
     return "\n".join(lines)
 
 
+def has_delta(meta: dict) -> bool:
+    """True when `interdiff` recorded what the push changed (``delta``), so the model reads
+    number_delta's diff; the prompt and the diff file must agree on this."""
+    return isinstance(meta.get("delta"), dict)
+
+
 def fence_for(text: str) -> str:
     """A backtick fence longer than the longest backtick run in ``text`` (at least four), so the
     text cannot close it."""
@@ -857,7 +876,7 @@ def review_prompt(template: str, repo: str, pr: int, tier: str, sha: str, diff_s
     body = body.strip() or "(empty)"
     values = {"REPO": repo, "PR": str(pr), "TIER": tier, "SHA": sha, "FENCE": fence_for(body),
               "DIFF_BLOCK": diff_block(diff_source, diff_file, meta.get("changed", []), meta.get("reverted", []),
-                                       ignored)}
+                                       ignored, delta=has_delta(meta))}
     verbatim = {"PR_TITLE": " ".join(str(title).split()), "PR_BODY": body,
                 "ROUND_BLOCK": round_block(state, mode, round_number, moved=bool(meta.get("fallback")))}
     return build_prompt(template, values, verbatim)
@@ -888,6 +907,44 @@ def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_
     ]
 
 
+def _hunk_counts(raw: str) -> tuple:
+    """(number of old lines, first new line, number of new lines) of a hunk header line."""
+    match = re.match(r"@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", raw)
+    if not match:
+        raise ValueError(f"unparsable hunk header: {raw!r}")
+    return (int(match.group(1)) if match.group(1) is not None else 1, int(match.group(2)),
+            int(match.group(3)) if match.group(3) is not None else 1)
+
+
+def _walk(diff_text: str):
+    """walk_diff with a fourth value: True for a line inside a hunk, False for a header line (a
+    line "@@ ..." outside a hunk is a hunk header; inside one it could only be content)."""
+    path = None
+    new_line = old_left = new_left = 0
+    for raw in git_lines(diff_text):
+        if old_left > 0 or new_left > 0:
+            # A context line of an empty source line may arrive as "" when trailing blanks are stripped.
+            if raw.startswith("+"):
+                yield raw, path, new_line, True
+                new_line, new_left = new_line + 1, new_left - 1
+            elif raw.startswith(" ") or raw == "":
+                yield raw, path, new_line, True
+                new_line, new_left, old_left = new_line + 1, new_left - 1, old_left - 1
+            else:
+                if raw.startswith("-"):
+                    old_left -= 1
+                yield raw, path, None, True
+            continue
+        if raw.startswith("diff --git "):
+            path = None
+        elif raw.startswith("+++ "):
+            target = raw[4:].strip()
+            path = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
+        elif raw.startswith("@@"):
+            old_left, new_line, new_left = _hunk_counts(raw)
+        yield raw, path, None, False
+
+
 def walk_diff(diff_text: str):
     """Yield ``(raw line, path, new-side line number or None)`` for every line of a unified diff.
 
@@ -896,35 +953,8 @@ def walk_diff(diff_text: str):
     ends when the line counts of its header are used up; only then are header lines read, so an
     added line "++ x" (shown as "+++ x") is content, not a "+++ b/file" header (Claude review
     finding on PR #497)."""
-    path = None
-    new_line = old_left = new_left = 0
-    for raw in git_lines(diff_text):
-        if old_left > 0 or new_left > 0:
-            # A context line of an empty source line may arrive as "" when trailing blanks are stripped.
-            if raw.startswith("+"):
-                yield raw, path, new_line
-                new_line, new_left = new_line + 1, new_left - 1
-            elif raw.startswith(" ") or raw == "":
-                yield raw, path, new_line
-                new_line, new_left, old_left = new_line + 1, new_left - 1, old_left - 1
-            else:
-                if raw.startswith("-"):
-                    old_left -= 1
-                yield raw, path, None
-            continue
-        if raw.startswith("diff --git "):
-            path = None
-        elif raw.startswith("+++ "):
-            target = raw[4:].strip()
-            path = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
-        elif raw.startswith("@@"):
-            match = re.match(r"@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", raw)
-            if not match:
-                raise ValueError(f"unparsable hunk header: {raw!r}")
-            old_left = int(match.group(1)) if match.group(1) is not None else 1
-            new_line = int(match.group(2))
-            new_left = int(match.group(3)) if match.group(3) is not None else 1
-        yield raw, path, None
+    for raw, path, number, _ in _walk(diff_text):
+        yield raw, path, number
 
 
 def commentable_lines(diff_text: str) -> dict:
@@ -944,6 +974,145 @@ def number_diff(diff_text: str) -> str:
     out = []
     for raw, _, number in walk_diff(diff_text):
         out.append(f"{number:>6} |{raw}" if number is not None else f"{'':>6} |{raw}")
+    return "\n".join(out) + ("\n" if out else "")
+
+
+#: Lines of a hunk shown on each side of a change in the diff of a further round (number_delta). A
+#: hunk of the PR's diff can be a whole new file; for more the model opens the file itself.
+#: ASSUMPTION: 30 lines show the function around a typical fix; not measured.
+DELTA_CONTEXT = 30
+#: A run of unchanged lines up to this length is shown: a one-line placeholder would save nothing.
+DELTA_SHOWN_RUN = 3
+_UNCHANGED = "unchanged since the last reviewed commit"
+
+
+def changed_since(diff_text: str) -> dict:
+    """What a push changed, per file, read from `git diff -U0 <reviewed commit> <head>`: for every
+    hunk ``[first new line, number of new lines, number of old lines]``. The new lines are new or
+    changed lines of the file at head. A hunk with old lines removed them right before its first
+    new line or, when it has no new lines, right after the line it names. A deleted file is keyed
+    by its old path, as in split_sections."""
+    hunks: dict = {}
+    for path, text in split_sections(diff_text):
+        if not path:
+            continue
+        for raw, _, _, inside in _walk(text):
+            if not inside and raw.startswith("@@"):
+                old_count, new_start, new_count = _hunk_counts(raw)
+                hunks.setdefault(path, []).append([new_start, new_count, old_count])
+    return hunks
+
+
+def _delta_line(mark: str, number, text: str) -> str:
+    return f"{mark}{number if number is not None else '':>6} |{text}"
+
+
+def _delta_section(text: str, changes, context: int) -> list:
+    """The lines of number_delta for one file section; ``changes`` are that file's hunks from
+    changed_since, or None when git named no changed line of it."""
+    headers, hunks = [], []  # hunks: [header line, [[raw line, new-side number, mark], ...]]
+    for raw, _, number, inside in _walk(text):
+        if inside or (hunks and raw.startswith("\\")):
+            hunks[-1][1].append([raw, number, ""])
+        elif raw.startswith("@@"):
+            hunks.append([raw, []])
+        else:
+            headers.append(raw)
+    out = [_delta_line(" ", None, raw) for raw in headers]
+    if changes is None:
+        # A binary file or a mode change: nothing can be cut away safely, so nothing is.
+        out.append(_delta_line(" ", None, "~ no changed line of this file is known since the last reviewed commit: "
+                                          "its whole section follows"))
+        for header, lines in hunks:
+            out.append(_delta_line(" ", None, header))
+            out += [_delta_line(" ", number, raw) for raw, number, _ in lines]
+        return out
+    added = {line for start, count, _ in changes for line in range(start, start + count)}
+    # Where old lines went: right after this line of the file at head.
+    removed_after = {start if count == 0 else start - 1 for start, count, old in changes if old}
+    shown_removals = set()
+    for header, lines in hunks:
+        _, new_start, new_count = _hunk_counts(header)
+        position = new_start if new_count == 0 else new_start - 1  # the new-side line a deleted line follows
+        for line in lines:
+            raw, number = line[0], line[1]
+            if number is not None:
+                position = number
+                if raw.startswith("+") and number in added:
+                    line[2] = ">"
+            elif raw.startswith("-") and position in removed_after:
+                # A line of the base branch the push deleted (with it, deletions made there before).
+                line[2] = ">"
+                shown_removals.add(position)
+    # Lines the PR had added and the push took out again leave no line in the PR's diff: say where.
+    for position in sorted({start for start, count, old in changes if old and count == 0} - shown_removals):
+        note = ["~ lines were removed here since the last reviewed commit", None, "~"]
+        for _, lines in hunks:
+            numbers = [line[1] for line in lines]
+            if position + 1 in numbers:
+                lines.insert(numbers.index(position + 1), note)
+                break
+            if position in numbers:
+                lines.insert(numbers.index(position) + 1, note)
+                break
+        else:
+            out.append(_delta_line(" ", None, f"~ lines were removed after line {position} since the last reviewed "
+                                              "commit; that part of the file is as on the base branch again"))
+
+    def shown(line: list) -> str:
+        return _delta_line(">" if line[2] == ">" else " ", line[1], line[0])
+
+    def left_out_hunks(count: int) -> str:
+        return _delta_line(" ", None, f"... {count} hunk{'' if count == 1 else 's'} left out: {_UNCHANGED} ...")
+
+    dropped = 0
+    for header, lines in hunks:
+        anchors = [index for index, line in enumerate(lines) if line[2]]
+        if not anchors:
+            dropped += 1
+            continue
+        if dropped:
+            out.append(left_out_hunks(dropped))
+            dropped = 0
+        out.append(_delta_line(" ", None, header))
+        keep = [False] * len(lines)
+        for anchor in anchors:
+            for index in range(max(0, anchor - context), min(len(lines), anchor + context + 1)):
+                keep[index] = True
+        index = 0
+        while index < len(lines):
+            end = index
+            while end < len(lines) and not keep[end]:
+                end += 1
+            run = lines[index:end]
+            if len(run) > DELTA_SHOWN_RUN:
+                numbers = [number for _, number, _ in run if number is not None]
+                where = f" (lines {numbers[0]}-{numbers[-1]} of the file)" if numbers else ""
+                out.append(_delta_line(" ", None, f"... {len(run)} lines left out: {_UNCHANGED}{where} ..."))
+            else:
+                out += [shown(line) for line in run]
+            if end < len(lines):
+                out.append(shown(lines[end]))
+            index = end + 1
+    if dropped:
+        out.append(left_out_hunks(dropped))
+    return out
+
+
+def number_delta(diff_text: str, delta: dict, context: int = DELTA_CONTEXT) -> str:
+    """The diff of a further round as the model reads it: number_diff's line numbers behind a
+    column that marks with ">" every line that is new or changed since the last reviewed commit
+    (``delta``: changed_since of the push), cut down to those lines and ``context`` lines of their
+    hunk on each side. A hunk without such a line is left out, a longer unchanged run inside a hunk
+    becomes one "... N lines left out ..." line, and a "~" line says where the push removed lines
+    that leave no trace in the PR's diff.
+
+    A further round used to read the whole section of every file the push touched, and a file that
+    is new in the PR is one hunk: a fix of a few lines had the model read, and report on, hundreds
+    of lines an earlier round had reviewed. The raw diff that `post` places findings on stays whole."""
+    out = []
+    for path, text in split_sections(diff_text):
+        out += _delta_section(text, delta.get(path) if path else None, context)
     return "\n".join(out) + ("\n" if out else "")
 
 
@@ -1437,19 +1606,24 @@ def _cmd_interdiff(args) -> int:
     # reviewed as such). Paths, not whole events, are compared: git's rename pairing (-M, similarity
     # >= 50 %) can turn a rename into a delete plus an add, or back, when the file is edited later.
     events_now = parse_name_status(_git(["diff", "--name-status", "-M", f"{base}...{head}"]))
+    meta = {"last_sha": last, "fallback": fallback, "changed": result.changed, "unchanged": result.unchanged,
+            "reverted": result.reverted}
     if last and not fallback:
         numstat = _git(["diff", "--numstat", last, head, "--", *result.changed]) if result.changed else ""
         paths_then = {path for event in parse_name_status(_git(["diff", "--name-status", "-M", f"{base}...{last}"]))
                       for path in event[1:]}
         events = [event for event in events_now if not set(event[1:]) <= paths_then]
+        # The lines the push itself changed in those files, so that the model reads the push and not
+        # the whole section of every file it touched (number_delta). Only a round that starts from a
+        # reviewed commit has this key.
+        meta["delta"] = (changed_since(_git(["diff", "-U0", last, head, "--", *result.changed]))
+                         if result.changed else {})
     else:
         numstat = _git(["diff", "--numstat", f"{base}...{head}"])
         events = events_now
     (out_dir / "interdiff.numstat").write_text(numstat, encoding="utf-8")
-    (out_dir / "interdiff.json").write_text(json.dumps(
-        {"last_sha": last, "fallback": fallback, "changed": result.changed, "unchanged": result.unchanged,
-         "reverted": result.reverted, "events": [list(event) for event in events],
-         "ignored_changed": ignored_changed}, indent=2), encoding="utf-8")
+    meta.update({"events": [list(event) for event in events], "ignored_changed": ignored_changed})
+    (out_dir / "interdiff.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[claude-review] interdiff: last complete round {last[:12] or '-'}, changed {len(result.changed)}, "
           f"unchanged {len(result.unchanged)}, reverted {len(result.reverted)}, "
           f"added/deleted/renamed {len(events)}")
@@ -1527,9 +1701,16 @@ def _cmd_review(args) -> int:
     # Raw diff for `post` (it maps findings onto diff lines); numbered copy for the model.
     diff_path.write_text(diff_text, encoding="utf-8")
     numbered_path = diff_path.with_name(diff_path.name + ".numbered")
-    numbered_path.write_text(number_diff(diff_text), encoding="utf-8")
+    # A further round reads the push: the lines changed since the last reviewed commit, with context.
+    cut_down = args.diff_source == "interdiff" and has_delta(meta)
+    numbered = number_delta(diff_text, meta["delta"]) if cut_down else number_diff(diff_text)
+    numbered_path.write_text(numbered, encoding="utf-8")
+    reads = f"model reads {numbered_path.as_posix()}"
+    if cut_down:
+        reads += (f": {len(git_lines(numbered))} lines, {sum(line.startswith('>') for line in git_lines(numbered))} "
+                  "line(s) changed since the last reviewed commit")
     print(f"[claude-review] round {args.round} ({args.mode}), diff source {args.diff_source}: "
-          f"{len(git_lines(diff_text))} lines -> {diff_path.as_posix()} (model reads {numbered_path.as_posix()}); "
+          f"{len(git_lines(diff_text))} lines -> {diff_path.as_posix()} ({reads}); "
           f"{len(dropped)} ignored file(s) left out" + (f": {', '.join(dropped[:10])}" if dropped else "")
           + f"; {len(open_findings(state))} open finding(s) of earlier rounds")
     if not diff_text.strip() and not open_findings(state):
