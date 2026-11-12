@@ -13,6 +13,7 @@ import importlib.util
 import json
 import pathlib
 import re
+import subprocess
 import sys
 
 import pytest
@@ -306,7 +307,7 @@ def test_a_failed_run_that_cost_money_is_recorded_and_counts_against_the_cap(tmp
     state = cr.decode_state(written[-1])
     assert state["rounds"][-1] == {"round": 2, "sha": "d" * 40, "tier": "full", "run_id": "78", "automatic": True,
                                    "complete": False, "model_call": True, "findings": 0}
-    assert cr.automatic_rounds(state) == 2 and cr.last_complete_sha(state) == "c" * 40
+    assert cr.automatic_rounds(state) == 2 and cr.reviewed_commit(state, _history(c=1, d=0)) == "c" * 40
     assert [f["status"] for f in state["findings"]] == ["open", "open"]
     visible = cr.strip_state(written[-1])
     assert "error_max_turns" in visible and "Tail unused" in visible  # names the failure, keeps the open findings
@@ -821,7 +822,7 @@ def test_merge_state_keys_rounds_by_commit_and_run_and_findings_by_id():
     # An incomplete round does not move the reviewed commit, but it called the model and counts
     # against the cap: otherwise a PR the model never reads in full is reviewed on every push
     # without limit (Claude review finding on PR #521). A round without a model call is free.
-    assert cr.last_complete_sha(merged) == "a" * 40 and cr.automatic_rounds(merged) == 2
+    assert cr.reviewed_commit(merged, _history(a=1, b=0)) == "a" * 40 and cr.automatic_rounds(merged) == 2
     free = dict(delta["rounds"][0], sha="c" * 40, run_id="3", model_call=False)
     assert cr.automatic_rounds(cr.merge_state(merged, dict(delta, rounds=[free]))) == 2
     # the same round posted twice (a retry) is one round
@@ -920,6 +921,8 @@ def test_interdiff_cli_reports_the_structure_changes_since_the_last_round(tmp_pa
                   "A\tsynthesis/population/new_stage.py\nD\tmatsim/gone.py\n")
 
     def fake_git(args):
+        if args[0] == "rev-list":
+            return "2\n"
         if "--name-status" in args:
             return then_status if args[-1].endswith("c" * 40) else now_status
         if "--numstat" in args:
@@ -1136,7 +1139,7 @@ def test_upsert_summary_merges_the_state_and_a_stale_run_keeps_the_visible_text(
     assert written.startswith("## Claude review (round 2)\n\nnewer text\n")          # visible text of the newer run kept
     merged = cr.decode_state(written)
     assert [r["round"] for r in merged["rounds"]] == [1, 2] and len(merged["findings"]) == 3
-    assert cr.last_complete_sha(merged) == "c" * 40                                    # an incomplete round does not advance it
+    assert cr.reviewed_commit(merged, _history(c=1, e=0)) == "c" * 40                 # an incomplete round does not advance it
 
 
 def test_two_rounds_on_the_same_commit_keep_their_findings_apart(monkeypatch):
@@ -1156,7 +1159,28 @@ def test_two_rounds_on_the_same_commit_keep_their_findings_apart(monkeypatch):
     assert sorted((f["title"], f["status"]) for f in state["findings"]) == [("t1", "resolved"), ("t2", "open")]
 
 
-def test_a_stale_round_does_not_become_the_last_reviewed_commit(monkeypatch):
+def _history(**commits):
+    """A stand-in for the git history: the number of commits between a reviewed commit and head, by
+    the first letter of its sha; a commit that is not named is no ancestor of head."""
+    return lambda sha: commits.get(sha[:1])
+
+
+def test_a_push_during_a_running_review_keeps_that_review_as_the_reviewed_commit():
+    # TUBS-IVS/eqasim-bs PR #571, #582 and #607: a fix pushed while the first deep review still ran made
+    # that round stale; the next run then found no reviewed commit and read the whole PR again on the
+    # deep tier (three whole reviews of each PR within 45 minutes, for pushes of 2 to 91 lines).
+    rounds = [{"round": 1, "sha": "a" * 40, "tier": "deep", "run_id": "1", "automatic": True, "complete": True,
+               "stale": True, "model_call": True, "findings": 1}]
+    state = {"schema": 1, "findings": [], "rounds": rounds}
+    assert cr.reviewed_commit(state, _history(a=1)) == "a" * 40
+    # ... but not after a rebase, when that commit is no ancestor of head any more
+    assert cr.reviewed_commit(state, _history()) == ""
+    # ... and a round that did not read everything never moves the reviewed commit, however new it is
+    rounds.append(dict(rounds[0], round=2, sha="b" * 40, run_id="2", complete=False, stale=False))
+    assert cr.reviewed_commit(state, _history(a=2, b=1)) == "a" * 40
+
+
+def test_the_newest_reviewed_commit_in_the_history_is_the_base_whatever_the_posting_order(monkeypatch):
     # Final review finding: a slow run of an OLDER commit posting after a newer round would become the
     # "last complete" commit, and the next interdiff would review already reviewed files again.
     existing = "## s\n" + cr.encode_state({"schema": 1, "findings": [], "rounds": [
@@ -1177,7 +1201,67 @@ def test_a_stale_round_does_not_become_the_last_reviewed_commit(monkeypatch):
                                                       "automatic": False, "complete": True, "model_call": True, "findings": 0}]}
     cr.upsert_summary("o/r", 5, "github-actions[bot]", "older", stale=True, state_delta=delta)
     merged = cr.decode_state([p["body"] for a, p in calls if p and "PATCH" in a][-1])
-    assert cr.last_complete_sha(merged) == "n" * 40
+    assert [r["sha"][:1] for r in merged["rounds"]] == ["n", "o"]      # posted last, but the older commit
+    assert cr.reviewed_commit(merged, _history(n=1, o=4)) == "n" * 40
+    # the same two rounds when the round posted last is also the newer commit
+    assert cr.reviewed_commit(merged, _history(n=4, o=1)) == "o" * 40
+
+
+def _commit(repo, name):
+    """Commit a change in the scratch repository ``repo`` and return its sha."""
+    def git(*args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.org",
+                               "-c", "commit.gpgsign=false", *args], cwd=repo, check=True, capture_output=True,
+                              text=True).stdout.strip()
+    (repo / "f.txt").write_text(name, encoding="utf-8")
+    git("add", "f.txt")
+    git("commit", "-q", "-m", name)
+    return git("rev-parse", "HEAD")
+
+
+def test_commits_between_follows_the_real_history(tmp_path, monkeypatch):
+    # The history picks the reviewed commit, so the distance must be right on a real repository: a
+    # commit nearer to head counts fewer commits, and one outside head's history counts as no ancestor.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    first, second, head = (_commit(tmp_path, name) for name in ("one", "two", "three"))
+    subprocess.run(["git", "checkout", "-q", "-b", "side", first], cwd=tmp_path, check=True, capture_output=True)
+    side = _commit(tmp_path, "aside")
+    monkeypatch.chdir(tmp_path)
+    assert [cr._commits_between(sha, head) for sha in (first, second, head)] == [2, 1, 0]
+    assert cr._commits_between(side, head) is None
+    assert cr._commits_between("f" * 40, head) is None            # a commit this checkout does not have
+
+
+def test_interdiff_cli_starts_from_a_stale_round_and_measures_only_the_push(tmp_path, monkeypatch):
+    # The gate of the run after a stale round: it must compare with that round's commit, so that the
+    # push is measured (and later read) and not the whole PR.
+    state = cr.empty_state()
+    state["rounds"].append({"round": 1, "sha": "a" * 40, "tier": "deep", "run_id": "1", "automatic": True,
+                            "complete": True, "stale": True, "model_call": True, "findings": 0})
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    base, last, head = "b" * 40, "a" * 40, "d" * 40
+    now = _THEN.replace("+    added = 3", "+    added = 4")
+
+    def fake_git(args):
+        if args[0] == "rev-list":
+            return "1\n"
+        if "--numstat" in args:
+            # the push alone: asked for as the difference between the reviewed commit and head
+            return "1\t1\tbraunschweig/a.py\n" if args[2:4] == [last, head] else "40\t2\tbraunschweig/a.py\n"
+        if "--name-status" in args:
+            return "M\tbraunschweig/a.py\nM\tbraunschweig/b.py\n"
+        return _THEN if args[-1] == f"{base}...{last}" else now
+
+    monkeypatch.setattr(cr, "_git", fake_git)
+    monkeypatch.setattr(cr, "_is_ancestor", lambda older, newer: True)
+    out_dir = tmp_path / "idiff"
+    assert cr.main(["interdiff", "--config", str(_CONFIG_PATH), "--state", str(state_path),
+                    "--base-sha", base, "--head-sha", head, "--out-dir", str(out_dir)]) == 0
+    meta = json.loads((out_dir / "interdiff.json").read_text(encoding="utf-8"))
+    assert (meta["last_sha"], meta["fallback"]) == (last, "")
+    assert (meta["changed"], meta["unchanged"]) == (["braunschweig/a.py"], ["braunschweig/b.py"])
+    assert (out_dir / "interdiff.numstat").read_text(encoding="utf-8") == "1\t1\tbraunschweig/a.py\n"
 
 
 def test_a_pr_body_with_a_long_backtick_run_cannot_close_the_fence():

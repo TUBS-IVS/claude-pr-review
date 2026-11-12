@@ -191,21 +191,37 @@ def strip_state(body: str) -> str:
     return body if span is None else body[:span[0]] + body[span[1]:]
 
 
-def last_complete_sha(state: dict) -> str:
-    """Commit of the newest round that reviewed everything it set out to (else ""). A stale round
-    (a slow run of a commit that was no longer the head when it posted) is skipped: it is newer
-    in the list but older in the history, and the next interdiff would re-review files again."""
-    for round_ in reversed(state["rounds"]):
-        if round_.get("complete") and not round_.get("stale"):
-            return str(round_.get("sha", ""))
-    return ""
+def complete_shas(state: dict) -> list:
+    """Commits of the rounds that reviewed everything they set out to, in the order they posted."""
+    return [str(round_["sha"]) for round_ in state["rounds"] if round_.get("complete") and round_.get("sha")]
+
+
+def reviewed_commit(state: dict, distance) -> str:
+    """The commit a further round starts from: of the rounds that reviewed everything they set out
+    to, the one whose commit is the newest ancestor of head ("" when there is none).
+    ``distance(sha)`` gives the number of commits between that commit and head, or None when it is
+    no ancestor of head (rebase, force-push).
+
+    The history decides, neither the order in which the rounds posted nor ``stale``. A round is
+    stale when a push arrived while its review still ran; that review still read its whole commit,
+    so the next round reads only what came after it. Skipping stale rounds made every such push a
+    review of the whole PR again, on the tier of the first round (TUBS-IVS/eqasim-bs PR #571, #582,
+    #607). A slow run of an older commit that posts after a newer round is further from head and so
+    never the base, which is what ``stale`` was read for before v1.5.0."""
+    best = None
+    for sha in complete_shas(state):
+        commits = distance(sha)
+        # "<=": of two commits equally far from head (unrelated histories) the round posted last wins.
+        if commits is not None and (best is None or commits <= best[0]):
+            best = (commits, sha)
+    return best[1] if best else ""
 
 
 def automatic_rounds(state: dict) -> int:
     """Rounds that count against rereview.max_rounds: every automatic round that called the model
     (``model_call``: the API reported a cost above zero), complete or not. A forced round and a round
     without a model call do not use one up. ``complete`` only decides whether the reviewed commit
-    moves (last_complete_sha): counting complete rounds only would let a PR the model never reads in
+    moves (reviewed_commit): counting complete rounds only would let a PR the model never reads in
     full be reviewed on every push without limit (Claude review finding on PR #521)."""
     return sum(1 for r in state["rounds"] if r.get("automatic") and r.get("model_call"))
 
@@ -1196,6 +1212,14 @@ def _is_ancestor(older: str, newer: str) -> bool:
     return subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True).returncode == 0
 
 
+def _commits_between(older: str, newer: str):
+    """The number of commits from ``older`` to ``newer``, or None when ``older`` is no ancestor of
+    ``newer`` (a rebase or force-push, or a commit this checkout does not have)."""
+    if not _is_ancestor(older, newer):
+        return None
+    return int(_git(["rev-list", "--count", f"{older}..{newer}"]).strip())
+
+
 def _gh_api(args: list, payload: dict | None = None) -> str:
     command = ["gh", "api", *args]
     if payload is None:
@@ -1327,9 +1351,10 @@ def _cmd_state(args) -> int:
         state = refresh_state(state, _fetch_threads(args.repo, args.pr))
     counts = {status: sum(1 for f in state["findings"] if f.get("status") == status)
               for status in ("open", "resolved", "dismissed")}
-    print(f"[claude-review] state: {len(state['rounds'])} rounds ({automatic_rounds(state)} automatic complete), "
-          f"open {counts['open']}, resolved {counts['resolved']}, dismissed {counts['dismissed']}, "
-          f"last complete {last_complete_sha(state)[:12] or '-'}")
+    # Which complete round the next one starts from is the interdiff's decision: it needs the history.
+    print(f"[claude-review] state: {len(state['rounds'])} rounds ({automatic_rounds(state)} automatic with a model "
+          f"call, {len(complete_shas(state))} complete), open {counts['open']}, resolved {counts['resolved']}, "
+          f"dismissed {counts['dismissed']}")
     Path(args.out).write_text(json.dumps(state, indent=2), encoding="utf-8")
     return 0
 
@@ -1341,13 +1366,15 @@ def _cmd_interdiff(args) -> int:
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     ignored = config.get("ignored_paths", [])
     state = json.loads(Path(args.state).read_text(encoding="utf-8"))
-    last = last_complete_sha(state)
     base, head = args.base_sha, args.head_sha
+    last = reviewed_commit(state, lambda sha: _commits_between(sha, head))
     full_now = _git(["diff", f"{base}...{head}"])
     now, ignored_changed = filter_diff(full_now, ignored)
     fallback = ""
     result = None
-    if last and not _is_ancestor(last, head):
+    if not last and complete_shas(state):
+        # Rounds exist, but none of their commits is in the history of head any more.
+        last = complete_shas(state)[-1]
         fallback = (f"reviewed commit {last[:12]} is not an ancestor of head (rebase or force-push?); "
                     "the whole PR is reviewed")
         print(f"[claude-review] fallback: {fallback}")
