@@ -832,7 +832,9 @@ def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, 
                 f"{reading} Review the changes marked `>` and `~`: whether each one is right, and whether it "
                 "breaks the code around it or code elsewhere. Report nothing about an unmarked line unless a "
                 "marked change makes it wrong or the defect is of high severity. The other files of the PR were "
-                f"reviewed before and did not change.{gone}{left_out}")
+                "reviewed before and did not change. The parts left out were reviewed before too: you have read "
+                "the whole diff (`coverage_complete` true) when you have read every line of this file, whether "
+                f"or not you opened a left-out part.{gone}{left_out}")
     if diff_source == "interdiff":
         return (f"This is a further round. The file {diff_file} holds the PR's diff against main for only "
                 f"the files whose change differs from the last reviewed commit: {', '.join(changed)}. "

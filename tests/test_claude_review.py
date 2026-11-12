@@ -1000,6 +1000,9 @@ def test_the_prompt_of_a_further_round_explains_the_marks():
     assert "starts with `~`" in block and "lines left out" in block and "hunks left out" in block
     # a defect of high severity is reported wherever the model sees it: the cut-down diff saves reading, not safety
     assert "unless a marked change makes it wrong or the defect is of high severity" in block
+    # The first live run (TUBS-IVS/eqasim-bs PR #614, round 2) read every marked line, did not open a
+    # left-out hunk and reported coverage_complete false, so the reviewed commit did not move.
+    assert "`coverage_complete` true) when you have read every line of this file" in block
     template = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8")
     meta = {"changed": ["braunschweig/a.py"], "reverted": [], "delta": {"braunschweig/a.py": [[12, 1, 1]]}}
     prompt = cr.review_prompt(template, "o/r", 7, "light", "abc123", "interdiff", "d.numbered", meta,
