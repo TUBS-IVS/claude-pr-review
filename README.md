@@ -37,8 +37,11 @@ How it works, in detail: [docs/how-it-works.md](docs/how-it-works.md). Changes p
 4. Add the gate config `.github/claude-review.yml`. Start from a sibling repository's or from
    [`tests/fixtures/caller/.github/claude-review.yml`](tests/fixtures/caller/.github/claude-review.yml) and set its
    paths for your repository. Keys: `labels` (`force`, `skip`), `skip_drafts`, `critical_paths`, `structure_paths`,
-   `ignored_paths`, `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`, an optional
-   `verify_after_cap`: verify rounds for fixes after the cap, default 2), `tiers` (`light`, `full`,
+   `ignored_paths`, an optional `supporting_paths` (documentation and tests: their volume alone does not make a
+   change deep), `skip_kinds`, `thresholds`, `rereview` (`max_rounds`, `verify_tier`, and optionally
+   `verify_after_cap`: verify rounds for fixes after the cap, default 2; `small_push_lines`: a push of at most that
+   many changed lines is only checked, on `verify_tier`; `verify_effort`: the effort of such checks and of the verify
+   rounds), `tiers` (`light`, `full`,
    `deep`, each with `model` (an alias such as `fable` or `opus` follows the newest version the pinned CLI knows; a
    full id such as `claude-opus-5-5` holds one version), `max_turns` and an optional `effort`: `low`, `medium`, `high`, `xhigh` or `max`; without
    it the model's default effort applies) and `review` (`prompt_file`, `allowed_tools` from Read, Grep, Glob). A

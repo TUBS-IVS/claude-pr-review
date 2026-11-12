@@ -7,7 +7,7 @@
         [--event-action labeled --event-label x]
     python claude_review.py review --config .github/claude-review.yml --tier full \
         --repo OWNER/NAME --pr 12 --sha <head sha> --out result.json [--diff-out .claude/review-pr.diff] \
-        [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N]
+        [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N --effort E]
     python claude_review.py post --result result.json --repo OWNER/NAME --pr 12 \
         --tier full --sha <head sha> [--diff-file pr.diff] [--dry-run]
     python claude_review.py outcome --execution-file result.json [--tier full] [--model m] [--json out.json]
@@ -25,13 +25,16 @@ classify decides WITHOUT calling a model whether the review runs and at which ti
 ("light", "full" or "deep"), from the `git diff --numstat` and `--name-status` of the PR (how
 much changed, and whether files of the structure paths were added, deleted or renamed), its
 branch kind, labels and draft state, against the thresholds in the config. It prints the decision with its reason
-and, under GitHub Actions, writes run/tier/model/max_turns/reason to $GITHUB_OUTPUT and a
-line to $GITHUB_STEP_SUMMARY, so a skipped review is never silent.
+and, under GitHub Actions, writes run/tier/model/max_turns/effort/reason to $GITHUB_OUTPUT and a
+line to $GITHUB_STEP_SUMMARY, so a skipped review is never silent. On a PR the review has seen before
+it gates the push alone (the `state` and `interdiff` commands say what was reviewed and what changed
+since), and a small push is only checked.
 
 review runs `claude -p` (Claude Code in print mode) with the API key in ANTHROPIC_API_KEY,
 the tier's model, turn and budget limits, read-only tools and a JSON schema for the findings,
 and writes the CLI's JSON result to --out. It hands the model the PR diff with the new-file
-line number in front of every line, so the model can cite lines GitHub accepts. Why it runs
+line number in front of every line, so the model can cite lines GitHub accepts; on a further round
+the diff is cut down to the lines that changed since the last reviewed commit. Why it runs
 `claude -p` and not anthropics/claude-code-action: see the note below. The model only reads;
 posting is done here.
 

@@ -3,6 +3,37 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
+## Unreleased
+
+Further rounds cost less: they start where the last review ended, read what the push changed, and a small push is
+only checked. Measured on the run records of TUBS-IVS/eqasim-bs (2026-11-04 to 2026-11-12) and replayed there without
+a model call (rounds 2 and 3 of its PR #571 read 13 and 39 lines instead of 1461 and 1486, on the light tier instead
+of the deep one).
+
+- A push that arrives while a review still runs no longer makes the next run review the whole PR again. That round is
+  stale, and a stale round never counted as the reviewed commit, so the next run started from nothing, on the tier of
+  the first round (TUBS-IVS/eqasim-bs PR #571, #582, #607: three whole deep reviews each, for pushes of 2 to 91 lines).
+  The reviewed commit is now the complete round whose commit is the newest ancestor of head, stale or not.
+- A further round reads the push, not the whole section of every file the push touched: its diff is cut down to the
+  lines changed since the last reviewed commit, marked `>`, with 30 lines of context; unchanged hunks are left out.
+  The prompt paragraph `{{DIFF_BLOCK}}` explains the marks, so no prompt file needs a change. Findings are still
+  placed on the whole sections.
+- New optional config key `supporting_paths` (documentation, tests): changed lines and files in these paths do not
+  count towards the deep tier's size thresholds (`deep_min_lines`, `deep_min_files`). They still count for the full
+  tier, the structure rules are unchanged, and the model still reads them. TUBS-IVS/eqasim-bs PR #553, 25 lines of
+  code and 1119 lines of documentation, was a deep review.
+- New optional key `rereview.small_push_lines`: a push of at most that many changed lines, without a structure
+  change, is only checked. It runs on `rereview.verify_tier` instead of the tier the first-round rules give it (nearly
+  all code is a critical path, so every fix was a full review), and never on a higher tier than they give.
+- New optional key `rereview.verify_effort`: the effort of every check, that is of the verify rounds and of small
+  pushes. Without it a check runs at the effort of its tier, as every run did.
+- The gate decides the effort of a run (new output `effort` of the gate job, passed to `review` and `outcome`); the
+  run record (log line, job summary, artifact) names it (new field `effort`).
+- Minor release: without the new keys the gate picks every tier as before. The caller's interface, the artifact
+  names, the findings record and the state block are unchanged (`stale` is still written, for an earlier version to
+  read after a roll-back), and the run record only gains `effort`. Two things change without a config change: the
+  round after a stale round, and the diff a further round reads.
+
 ## v1.4.0 (2026-11-11)
 
 - A tier's `model` may be an alias such as `fable` or `opus`; the pinned CLI resolves it to the newest version it

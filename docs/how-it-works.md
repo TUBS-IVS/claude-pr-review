@@ -36,7 +36,7 @@ above then no longer apply.
 
 | Job | Calls the API | Does |
 |---|---|---|
-| `classify` | no | `check-config` (see below), `state` and `interdiff` (see "Rounds"), then `classify`: reads `git diff --numstat base...head` and `--name-status -M base...head`, the branch kind, labels, draft state, the state and the interdiff, and decides `none` / `light` / `full` / `deep` plus the outputs `mode`, `diff_source`, `round` |
+| `classify` | no | `check-config` (see below), `state` and `interdiff` (see "Rounds"), then `classify`: reads `git diff --numstat base...head` and `--name-status -M base...head`, the branch kind, labels, draft state, the state and the interdiff, and decides `none` / `light` / `full` / `deep` plus the outputs `mode`, `diff_source`, `round`, `effort` |
 | `review` | yes, only if `classify` says so | installs the pinned Claude Code CLI, recomputes `state` and `interdiff` (no artifact travels between the jobs), `review` (runs `claude -p`), `outcome`, `post` |
 
 **`check-config` comes first.** It validates the calling repository's config and the prompt it names
@@ -73,7 +73,7 @@ first-round order, a PR without a complete round on record, is below, the furthe
 5. Branch kind in `skip_kinds` (e.g. `docs/`) without a critical path -> no review.
 6. Deep tier: a file of `structure_paths` added, deleted, renamed or copied (either path of a rename counts); or
    >= `deep_min_structure_files` structure files or >= `deep_min_structure_lines` changed lines in them; or
-   >= `deep_min_lines` changed lines or >= `deep_min_files` changed files anywhere.
+   >= `deep_min_lines` changed lines or >= `deep_min_files` changed files outside `supporting_paths` (below).
 7. Full tier: a critical path (every structure path is also critical), or >= `full_min_lines` lines, or
    >= `full_min_files` files.
 8. Light tier: any other counted change.
@@ -81,6 +81,12 @@ first-round order, a PR without a complete round on record, is below, the furthe
 
 The three tiers and why the deep one exists: ADR-0175 in TUBS-IVS/eqasim-bs. `structure_paths` names the backbone of
 a repository; keep it a short list, so that routine additions stay full-tier changes.
+
+`supporting_paths` (optional) names what supports a change rather than makes it: documentation and tests. Their
+changed lines and files do not count towards `deep_min_lines` and `deep_min_files`, so a long ADR or test file next to
+a short code change is no deep review. They are still read, still count towards the full tier's thresholds, and the
+structure rules count a path whatever else it matches. The gate's reason names their share (`... changed lines in N
+files, X of them in Y supporting files`). Without the key every line counts alike, as before v1.5.0.
 
 Runs queue per PR and event kind, and a running review is never cancelled: its cost is already spent, and its round is
 recorded only at the end. A newer push replaces a still-pending push run. Every label event runs in a concurrency group
@@ -111,8 +117,9 @@ checks the fix; the bot's own `Re-review at ...` reply never dismisses, and only
 `open` findings go to the
 model. `post` re-reads the comment and merges rounds and findings (`merge_state`) before writing, so a run for a
 commit that is no longer the head still records its findings but leaves the visible summary text alone; its round is
-marked `stale` and never becomes the last reviewed commit. Threads of resolved findings are closed only after the state
-is written. `model_call` says whether the round called the model (the API reported a cost above zero); the block is
+marked `stale`. A stale round still read its whole commit, so it can be the reviewed commit the next round starts from
+(`last`, below). Threads of resolved findings are closed only after the state is written. `model_call` says whether
+the round called the model (the API reported a cost above zero); the block is
 part of a public comment, so it never holds the amount ("Run record"). A block written before v1.3.0 carries
 `cost_usd` per round instead: `decode_state` turns it into `model_call` and drops the amount, so the round cap of an
 open PR still holds and the next write of the comment no longer shows it.
@@ -121,8 +128,15 @@ open PR still holds and the next write of the comment no longer shows it.
 `state.json`. `interdiff --config --state --base-sha --head-sha --out-dir` compares `git diff base...last` and
 `git diff base...head` per file section (`split_sections`; `index` lines and hunk numbers are normalised away, so a
 merge of the base branch shifts nothing) and writes `interdiff.diff`, `.numstat` and `.json` (changed, unchanged and
-reverted paths; a renamed file is changed). `last` is the last round with `complete: true` (`last_complete_sha`).
-`classify` takes `--state`, `--interdiff-json`, `--interdiff-numstat`.
+reverted paths; a renamed file is changed; `delta`, the lines the push itself changed, see "The review run and the
+posting"). `classify` takes `--state`, `--interdiff-json`, `--interdiff-numstat`.
+
+**The reviewed commit.** `last` is, of the rounds with `complete: true`, the one whose commit is the newest ancestor
+of head, by the number of commits between them (`reviewed_commit`, `git rev-list --count`). The history decides,
+neither the order in which the rounds posted nor `stale`. A push that arrives while a review still runs makes that
+round stale; before v1.5.0 a stale round was never `last`, so the next run found no reviewed commit and read the whole
+PR again on the tier of the first round. A slow run of an older commit that posts after a newer round is further from
+head and so never `last`.
 
 **Decision order of a further round** (a state with a complete round, a push-like event): skip label, other label
 events and drafts as in the first round; then `rereview.max_rounds` automatic rounds that called the model
@@ -135,7 +149,11 @@ diff); before the cap: nothing changed -> none, unless findings are open and a f
 can fix a finding, a merge of the base branch cannot) -> `rereview.verify_tier` with no diff (the model verifies at
 head); otherwise the tier of the interdiff numstat with the normal thresholds, critical and structure paths, raised to
 `rereview.verify_tier` when that is none (e.g. a `docs/` branch without a critical path) but findings are open; a push
-of ignored files alone gets no run, like a merge of the base branch, since it cannot fix a finding. A structure change
+of ignored files alone gets no run, like a merge of the base branch, since it cannot fix a finding. A push of at most
+`rereview.small_push_lines` changed lines (optional; without the key this rule is off) and without a structure change
+is only checked: it runs on `rereview.verify_tier` instead of the tier the thresholds and paths give it, and never on
+a higher tier than they give. Nearly all code of a repository is a critical path, so without this rule a fix of a few
+lines is a full review. A structure change
 of a further round is a file added, deleted or renamed against the base at head that was not so at the last complete
 round (`interdiff` writes these as `events` in `interdiff.json`), so a file added in round 1 does not make every later
 round deep. The `skip_kinds` rule applies as in the first round.
@@ -144,12 +162,17 @@ round deep. The `skip_kinds` rule applies as in the first round.
 `diff_source` `pr`), whatever the cap and the interdiff, recorded with `automatic: false` and not counted against the
 cap. It still gets the open findings.
 
+**The effort of a run** is the gate's decision too (output `effort`, empty for the model's default), handed to the
+review job: the `effort` of the run's tier, or, for a check, `rereview.verify_effort` (optional). A check is every
+verify round and every small push; a first round, a forced round and a larger push run at the effort of their tier.
+
 **Fallbacks, all logged with `[claude-review]`, in the job summary and the summary comment.**
 - Summary without a state block (or a corrupt one): `fallback: no state block in the existing summary; first-round
   review, earlier findings unknown`; the state starts empty.
-- `last` not an ancestor of head (rebase, force-push): `fallback: reviewed commit <sha12> is not an ancestor of head
-  (rebase or force-push?); the whole PR is reviewed`; the round counter and the open findings are kept, the cap still
-  applies, and the prompt tells the model that the line numbers of the open findings may have moved.
+- No complete round's commit is an ancestor of head (rebase, force-push): `fallback: reviewed commit <sha12> is not an
+  ancestor of head (rebase or force-push?); the whole PR is reviewed`; the round counter and the open findings are
+  kept, the cap still applies, and the prompt tells the model that the line numbers of the open findings may have
+  moved.
 - A PR with more than 100 review threads: `::warning::`; findings beyond the first page keep their status (the same
   single page the session retro reads).
 - No model call (only ignored files changed, nothing open): the round is recorded with `complete: false` and
@@ -162,7 +185,8 @@ cap. It still gets the open findings.
   failed run that cost nothing records nothing (a Claude review finding on a copy of this script: such runs were never
   recorded, so a review that failed every time ran, and billed, on every push).
 
-**The run.** `review` also gets `--state`, `--interdiff-dir`, `--diff-source`, `--mode`, `--round` and `GH_TOKEN`: it
+**The run.** `review` also gets `--state`, `--interdiff-dir`, `--diff-source`, `--mode`, `--round`, `--effort` and
+`GH_TOKEN`: it
 fetches the PR title and body (`gh api`) and `review_prompt` puts them in a fenced block headed "PR description" (data,
 not instructions; `fence_for` makes the fence longer than any backtick run in the body, so the body cannot close it,
 and `build_prompt` fills values in one pass, so a placeholder in the body stays text). The prompt of each repository
@@ -186,8 +210,9 @@ the free `classify` job; suppressing them in the caller would copy the label nam
 
 - `review` fills the placeholders of the prompt file (`review.prompt_file`) and runs `claude -p` with the tier's
   `model` (a full id, or an alias such as `fable` that the pinned CLI resolves to the newest version it knows,
-  Claude Code docs "Model configuration"; the run record names the version called, "Run record"), its `effort` when
-  the config sets one (`--effort`; otherwise the model's default, per the same docs page; the log line names it),
+  Claude Code docs "Model configuration"; the run record names the version called, "Run record"), the effort the
+  gate decided (`--effort`: the tier's `effort` or, for a check, `rereview.verify_effort`, see "Rounds"; without any,
+  the model's default, per the same docs page; the log line names it),
   `max_turns`, the tier's budget (`tier_budget`: from the secret, "The gate"; a hard cap per run, never printed: the
   log line names only its source), the JSON schema `FINDINGS_SCHEMA`, `--bare`
   (authentication strictly by `ANTHROPIC_API_KEY`, never a Claude plan login; no user hooks, plugins, memory or
@@ -214,8 +239,18 @@ the free `classify` job; suppressing them in the caller would copy the label nam
   newer one; its inline comments are still posted. A failed run (`is_error`, or no structured output) posts no findings
   and fails the step with the error text; when it cost money its round is still recorded (see the fallbacks above).
   The diff is read with `errors="replace"`: a non-UTF-8 byte (e.g. in a Latin-1 data file) must not crash the review.
-  On a further round the model reads the numbered interdiff (`diff_source` `interdiff`, whole file sections at head
-  line numbers) or no diff at all (`none`: only open findings to verify); the posting then follows "Rounds".
+- On a further round (`diff_source` `interdiff`) the model reads the push, not the whole section of every file the
+  push touched (a file that is new in the PR is one hunk, so a fix of a few lines meant reading, and reporting on,
+  hundreds of reviewed lines). `interdiff` records the lines the push itself changed (`delta` in `interdiff.json`:
+  `changed_since` of `git diff -U0 last head` for the changed files), and `number_delta` cuts the numbered diff down
+  to them: a `>` in front marks every line that is new or changed since `last`, `DELTA_CONTEXT` lines of its hunk
+  stay on each side, a hunk without such a line is left out, a longer unchanged run becomes one `... N lines left
+  out ...` line, and a `~` line says where the push removed lines that leave no trace in the PR's diff. Only an added
+  line of the PR's diff is marked, so a change of the base branch that a merge brought in is not. A file of which git
+  names no changed line (binary, mode change) is shown whole. The prompt paragraph `{{DIFF_BLOCK}}` explains the
+  marks. The raw diff that `post` places findings on stays the whole sections (`interdiff.diff`), so a finding on a
+  context line is still an inline comment. With `diff_source` `none` there is no diff at all (only open findings to
+  verify). The posting of a further round follows "Rounds".
 - `post --dry-run` prints both payloads and posts nothing, for local tests.
 
 ## Learning from the findings (session retro)
@@ -243,7 +278,8 @@ The outcome is read from the replies in the finding's review thread, so answer e
 ## Run record
 
 After every review, `claude_review.py outcome` reads the `claude -p` JSON result and reports how the run ended: its
-status, tier, model, turns and duration **as the CLI reported them**. For the model it gives the configured name
+status, tier, model, turns and duration **as the CLI reported them**, and the effort the gate decided for it. For
+the model it gives the configured name
 and, when that is an alias, the ids the CLI called (`models_used`, the keys of the result's `modelUsage`), e.g.
 `fable (claude-fable-5-2)`. It writes a table to the job summary and uploads
 `claude-review-cost.json` as the artifact `claude-review-cost-pr<NN>-run<id>-<attempt>` (90 days; file and artifact
