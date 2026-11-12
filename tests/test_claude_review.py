@@ -887,7 +887,7 @@ def test_no_change_of_a_push_is_invisible_in_the_cut_down_diff():
     # Whatever the push changed must leave a trace, or a part of the PR's change that was taken back
     # (the code that used it may still be there) would pass unseen. A changed line that is a context
     # line of the PR's diff now, i.e. as on the base branch again, is marked like an added one ...
-    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[13, 1, 1]]}, _A_BEFORE).splitlines()
+    view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[13, 1, 1]]}, _A_NOW).splitlines()
     assert view[8:10] == ["     12 |+    added = 3", ">    13 |     tail = 4"]
     # ... and changes where the PR's diff has no hunk any more are named once, by their lines
     view = cr.number_delta(_A_NOW, {"braunschweig/a.py": [[12, 1, 1], [25, 0, 3], [300, 2, 2]]}, _A_BEFORE).splitlines()
@@ -937,12 +937,36 @@ def test_a_hunk_that_the_base_branch_changed_under_the_pr_is_shown():
     view = cr.number_delta(_MERGED_BEFORE, {"c.py": [[50, 1, 1]]}, before).splitlines()
     assert view[4:] == [
         "        |@@ -1,3 +1,3 @@",
-        "        |~ this hunk is not as an earlier round reviewed it, although no line of it changed at head: the "
-        "base branch changed under it",
+        "        |~ this hunk is not as an earlier round reviewed it, although no line of it changed at head (a merge "
+        "of the base branch, or its borders moved): read it whole",
         "      1 | a = 1", "        |-x = 1", "      2 |+x = 2", "      3 | b = 3"]
     # ... while the same hunk, reviewed before as it is, is left out
     view = cr.number_delta(_MERGED_BEFORE, {"c.py": [[50, 1, 1]]}, _MERGED_BEFORE).splitlines()
     assert view[4:] == ["        |... 1 hunk left out: unchanged since the last reviewed commit ..."]
+
+
+def test_a_line_the_pr_now_adds_back_is_marked():
+    # Second review finding: main deleted a function the PR changes, the author kept the PR's file in
+    # the merge, and the PR now adds the whole function back. No line changed at head, and the hunk
+    # removes nothing; it was left out as unchanged.
+    before = ("diff --git a/h.py b/h.py\n--- a/h.py\n+++ b/h.py\n@@ -7,3 +7,3 @@\n"
+              " def helper():\n-    a = 1\n+    a = 2\n     return a\n")
+    now = ("diff --git a/h.py b/h.py\n--- a/h.py\n+++ b/h.py\n@@ -6,0 +7,3 @@\n"
+           "+def helper():\n+    a = 2\n+    return a\n")
+    view = cr.number_delta(now, {"h.py": [[50, 1, 1]]}, before).splitlines()
+    assert view[4:] == ["        |@@ -6,0 +7,3 @@", ">     7 |+def helper():", "      8 |+    a = 2",
+                        ">     9 |+    return a"]
+    # a hunk reviewed before, line for line, is still left out
+    assert cr.number_delta(before, {"h.py": [[50, 1, 1]]}, before).splitlines()[4] == \
+        "        |... 1 hunk left out: unchanged since the last reviewed commit ..."
+
+
+def test_every_hidden_part_of_a_push_hunk_is_named():
+    # A push hunk over two PR hunks: each part between and after them is named by its first line.
+    now = ("diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -7,2 +7,2 @@\n-a\n+b\n c\n"
+           "@@ -21,2 +21,2 @@\n-d\n+e\n f\n")
+    view = cr.number_delta(now, {"t.py": [[5, 30, 30]]}, now).splitlines()
+    assert "changed at line 5, 9, 23, where" in view[3]
 
 
 def test_a_changed_hunk_that_deletes_lines_is_never_cut_down():
@@ -1085,6 +1109,9 @@ def test_the_review_of_a_further_round_reads_the_cut_down_diff_and_posts_on_the_
     # the log says how much was cut away and how much could not be, so the saving can be read from a run
     assert ("18 lines, 3 line(s) changed since the last reviewed commit, 0 note(s), 1 hunk(s) left out, "
             "0 file(s) shown whole") in capsys.readouterr().out
+    # ... and counts every kind of note and every file shown whole
+    _, cut = cr._delta_view(_DIFF + _NEW_FILE, {"braunschweig/a.py": [[12, 1, 1], [300, 1, 1], [11, 0, 1]]}, _A_BEFORE)
+    assert cut == {"marked": 1, "notes": 4, "hunks_left_out": 1, "whole": 2}   # two whole files, line 300, line 11
     # Without the PR's diff at the reviewed commit nothing proves a hunk with deleted lines unchanged: it is shown.
     (idir / "interdiff.then.diff").unlink()
     assert cr.main(command) == 0

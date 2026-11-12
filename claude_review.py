@@ -1054,6 +1054,8 @@ def _delta_section(text: str, changes, then_text: str, context: int) -> tuple:
     reviewed_hunks = {tuple(raw for raw, _, _ in lines) for _, lines in reviewed}
     reviewed_removals = {raw for _, lines in reviewed for raw, number, _ in lines
                          if number is None and raw.startswith("-")}
+    reviewed_additions = {raw for _, lines in reviewed for raw, number, _ in lines
+                          if number is not None and raw.startswith("+")}
     added = {line for start, count, _ in changes for line in range(start, start + count)}
     # Where old lines went: right after this line of the file at head.
     removed_after = {start if count == 0 else start - 1 for start, count, old in changes if old}
@@ -1078,12 +1080,20 @@ def _delta_section(text: str, changes, then_text: str, context: int) -> tuple:
                 # A deletion no earlier round saw: the base branch changed the line the PR removes (a
                 # merge), so what the PR does here changed although no line of it did at head.
                 line[2] = ">"
+            if number is not None and raw.startswith("+") and raw not in reviewed_additions:
+                # An addition no earlier round saw, although the line itself is old: the base branch
+                # dropped it (a merge), so the PR now adds it back.
+                line[2] = ">"
     # A hunk that removes lines and is not, line for line, a hunk an earlier round read is never cut
     # down and never left out: what it removes can change without a changed line at head, and a
     # removed line that reads like another one was (a blank line, "pass") cannot be told apart by
     # its text. Decided before the notes below are put between the lines.
-    whole = [any(number is None and raw.startswith("-") for raw, number, _ in lines)
-             and tuple(raw for raw, _, _ in lines) not in reviewed_hunks for _, lines in hunks]
+    # A hunk without removed lines that no round read is not left out either (a merge can make a line the
+    # PR keeps an addition: main dropped it); it is shown whole when nothing in it can be marked.
+    unreviewed = [tuple(raw for raw, _, _ in lines) not in reviewed_hunks for _, lines in hunks]
+    whole = [new and (any(number is None and raw.startswith("-") for raw, number, _ in lines)
+                      or not any(line[2] for line in lines))
+             for new, (_, lines) in zip(unreviewed, hunks)]
     # Every change of the push leaves a trace: a part of the PR's change that was taken back would
     # otherwise pass unseen, and the code that used it may still be there. Lines the PR had added and
     # the push removed leave no line in the PR's diff, so a note stands where they stood; a change
@@ -1142,7 +1152,8 @@ def _delta_section(text: str, changes, then_text: str, context: int) -> tuple:
         counts["notes"] += sum(line[2] == "~" for line in lines)
         if not anchors:
             out.append(_delta_line(" ", None, "~ this hunk is not as an earlier round reviewed it, although no line of "
-                                              "it changed at head: the base branch changed under it"))
+                                              "it changed at head (a merge of the base branch, or its borders moved): "
+                                              "read it whole"))
             counts["notes"] += 1
         keep = [all_of_it] * len(lines)
         for anchor in anchors:
