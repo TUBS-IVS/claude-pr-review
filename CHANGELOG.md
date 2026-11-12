@@ -3,7 +3,7 @@
 Every release is a tag `vMAJOR.MINOR.PATCH`; the major tag (`v1`) moves to the newest release of its
 major version, and callers name the major tag (README.md, "Versions"). The newest release comes first.
 
-## Unreleased
+## v1.5.0 (2026-11-12)
 
 Further rounds cost less: they start where the last review ended, read what the push changed, and a small push is
 only checked. Measured on the run records of TUBS-IVS/eqasim-bs (2026-11-04 to 2026-11-12) and replayed there without
