@@ -863,12 +863,28 @@ def test_lines_removed_since_the_last_round_are_named_where_they_stood():
     # ... a removed line of the base branch shows as a deleted line of the PR's diff, and is marked
     view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[10, 0, 1]]}).splitlines()
     assert view[5:8] == ["     10 |     keep = 1", ">       |-    old = 2", "     11 |+    new = 2"]
-    # ... and lines removed where the file is as on the base branch again have no hunk to show them in
+
+
+def test_no_change_of_a_push_is_invisible_in_the_cut_down_diff():
+    # Whatever the push changed must leave a trace, or a part of the PR's change that was taken back
+    # (the code that used it may still be there) would pass unseen. A changed line that is a context
+    # line of the PR's diff now, i.e. as on the base branch again, is marked like an added one ...
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[13, 1, 1]]}).splitlines()
+    assert view[8:10] == ["     12 |+    added = 3", ">    13 |     tail = 4"]
+    # ... and changes where the PR's diff has no hunk any more are named once, by their lines
+    view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[12, 1, 1], [25, 0, 3], [300, 2, 2]]}).splitlines()
+    assert view[4] == ("        |~ since the last reviewed commit this file also changed at line 25, 300, where it is as on "
+                       "the base branch now (a change of the base branch, or a part of the PR's change that was taken "
+                       "back): open the file to see it")
+    assert view[5] == "        |@@ -10,3 +10,4 @@ def f():" and view[9] == ">    12 |+    added = 3"
+    # ... also when nothing else of the file is left to show
     view = cr.number_delta(_DIFF, {"braunschweig/a.py": [[25, 0, 3]]}).splitlines()
-    assert view[4:6] == [
-        "        |~ lines were removed after line 25 since the last reviewed commit; that part of the file is as "
-        "on the base branch again",
-        "        |... 2 hunks left out: unchanged since the last reviewed commit ..."]
+    assert view[4].startswith("        |~ since the last reviewed commit this file also changed at line 25, where")
+    assert view[5] == "        |... 2 hunks left out: unchanged since the last reviewed commit ..."
+    # more than ten such places are counted, not listed
+    far = [[100 * n, 1, 1] for n in range(1, 14)]
+    assert "at line 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 (+3 more), where" in \
+        cr.number_delta(_DIFF, {"braunschweig/a.py": far}).splitlines()[4]
 
 
 def test_a_file_without_a_changed_line_is_shown_whole():
@@ -887,6 +903,8 @@ def test_a_file_without_a_changed_line_is_shown_whole():
 def test_the_prompt_of_a_further_round_explains_the_marks():
     block = cr.diff_block("interdiff", "d.numbered", ["braunschweig/a.py"], [], delta=True)
     assert "starts with `>`" in block and "`~`" in block and "left out" in block and "braunschweig/a.py" in block
+    # a defect of high severity is reported wherever the model sees it: the cut-down diff saves reading, not safety
+    assert "unless a marked change makes it wrong or the defect is of high severity" in block
     template = (_CALLER / CONFIG["review"]["prompt_file"]).read_text(encoding="utf-8")
     meta = {"changed": ["braunschweig/a.py"], "reverted": [], "delta": {"braunschweig/a.py": [[12, 1, 1]]}}
     prompt = cr.review_prompt(template, "o/r", 7, "light", "abc123", "interdiff", "d.numbered", meta,

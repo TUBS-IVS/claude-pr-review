@@ -244,13 +244,17 @@ the free `classify` job; suppressing them in the caller would copy the label nam
   hundreds of reviewed lines). `interdiff` records the lines the push itself changed (`delta` in `interdiff.json`:
   `changed_since` of `git diff -U0 last head` for the changed files), and `number_delta` cuts the numbered diff down
   to them: a `>` in front marks every line that is new or changed since `last`, `DELTA_CONTEXT` lines of its hunk
-  stay on each side, a hunk without such a line is left out, a longer unchanged run becomes one `... N lines left
-  out ...` line, and a `~` line says where the push removed lines that leave no trace in the PR's diff. Only an added
-  line of the PR's diff is marked, so a change of the base branch that a merge brought in is not. A file of which git
-  names no changed line (binary, mode change) is shown whole. The prompt paragraph `{{DIFF_BLOCK}}` explains the
-  marks. The raw diff that `post` places findings on stays the whole sections (`interdiff.diff`), so a finding on a
-  context line is still an inline comment. With `diff_source` `none` there is no diff at all (only open findings to
-  verify). The posting of a further round follows "Rounds".
+  stay on each side, a hunk without such a line is left out, and a longer unchanged run becomes one `... N lines left
+  out ...` line. Every change of the push leaves a trace, so that a part of the PR's change that was taken back (the
+  code that used it may still be there) cannot pass unseen: a changed line that is a context line of the PR's diff
+  now is marked like an added one, a `~` line stands where the push removed lines the PR had added, and one `~` line
+  per file names the lines that changed where the PR's diff has no hunk any more (there the file is as on the base
+  branch: a part taken back, or a change of the base branch that a merge brought in). A file of which git names no
+  changed line (binary, mode change) is shown whole. The prompt paragraph `{{DIFF_BLOCK}}` explains the marks and
+  tells the model to report on an unmarked line only when a marked change makes it wrong or the defect is of high
+  severity. The raw diff that `post` places findings on stays the whole sections (`interdiff.diff`), so a finding on
+  a context line is still an inline comment. With `diff_source` `none` there is no diff at all (only open findings
+  to verify). The posting of a further round follows "Rounds".
 - `post --dry-run` prints both payloads and posts nothing, for local tests.
 
 ## Learning from the findings (session retro)

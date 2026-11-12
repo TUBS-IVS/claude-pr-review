@@ -817,12 +817,13 @@ def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, 
                 f"the files whose change differs from the last reviewed commit ({', '.join(changed)}), cut down "
                 "to what changed since then. A line that starts with `>` is new or changed since the last "
                 "reviewed commit. The unmarked lines around it are context that an earlier round reviewed. A "
-                "line whose text starts with `~` says where lines were removed. A line `... N lines left out "
+                "line whose text starts with `~` names a change that left no line to mark: lines that were "
+                "removed, or a part of the file that is as on the base branch now. A line `... N lines left out "
                 "...` stands for an unchanged part, which you can open in the file itself with Read. "
                 f"{reading} Review the changes marked `>` and `~`: whether each one is right, and whether it "
                 "breaks the code around it or code elsewhere. Report nothing about an unmarked line unless a "
-                "marked change makes it wrong. The other files of the PR were reviewed before and did not "
-                f"change.{gone}{left_out}")
+                "marked change makes it wrong or the defect is of high severity. The other files of the PR were "
+                f"reviewed before and did not change.{gone}{left_out}")
     if diff_source == "interdiff":
         return (f"This is a further round. The file {diff_file} holds the PR's diff against main for only "
                 f"the files whose change differs from the last reviewed commit: {', '.join(changed)}. "
@@ -1033,6 +1034,7 @@ def _delta_section(text: str, changes, context: int) -> list:
     added = {line for start, count, _ in changes for line in range(start, start + count)}
     # Where old lines went: right after this line of the file at head.
     removed_after = {start if count == 0 else start - 1 for start, count, old in changes if old}
+    visible = {number for _, lines in hunks for _, number, _ in lines if number is not None}
     shown_removals = set()
     for header, lines in hunks:
         _, new_start, new_count = _hunk_counts(header)
@@ -1041,26 +1043,42 @@ def _delta_section(text: str, changes, context: int) -> list:
             raw, number = line[0], line[1]
             if number is not None:
                 position = number
-                if raw.startswith("+") and number in added:
+                # An added line, or a context line: one that the push changed back to the base branch's.
+                if number in added:
                     line[2] = ">"
             elif raw.startswith("-") and position in removed_after:
                 # A line of the base branch the push deleted (with it, deletions made there before).
                 line[2] = ">"
                 shown_removals.add(position)
-    # Lines the PR had added and the push took out again leave no line in the PR's diff: say where.
-    for position in sorted({start for start, count, old in changes if old and count == 0} - shown_removals):
+    # Every change of the push leaves a trace: a part of the PR's change that was taken back would
+    # otherwise pass unseen, and the code that used it may still be there. Lines the PR had added and
+    # the push removed leave no line in the PR's diff, so a note stands where they stood; a change
+    # where the PR's diff has no hunk (the file is as on the base branch there) is named by its line.
+    elsewhere = []
+    for start, count, _ in changes:
+        if count:
+            if not visible.intersection(range(start, start + count)):
+                elsewhere.append(start)
+            continue
+        if start in shown_removals:
+            continue
         note = ["~ lines were removed here since the last reviewed commit", None, "~"]
         for _, lines in hunks:
             numbers = [line[1] for line in lines]
-            if position + 1 in numbers:
-                lines.insert(numbers.index(position + 1), note)
+            if start + 1 in numbers:
+                lines.insert(numbers.index(start + 1), note)
                 break
-            if position in numbers:
-                lines.insert(numbers.index(position) + 1, note)
+            if start in numbers:
+                lines.insert(numbers.index(start) + 1, note)
                 break
         else:
-            out.append(_delta_line(" ", None, f"~ lines were removed after line {position} since the last reviewed "
-                                              "commit; that part of the file is as on the base branch again"))
+            elsewhere.append(start)
+    if elsewhere:
+        places = ", ".join(str(line) for line in elsewhere[:10]) + (f" (+{len(elsewhere) - 10} more)"
+                                                                   if len(elsewhere) > 10 else "")
+        out.append(_delta_line(" ", None, f"~ since the last reviewed commit this file also changed at line {places}, "
+                                          "where it is as on the base branch now (a change of the base branch, or a "
+                                          "part of the PR's change that was taken back): open the file to see it"))
 
     def shown(line: list) -> str:
         return _delta_line(">" if line[2] == ">" else " ", line[1], line[0])
@@ -1107,8 +1125,8 @@ def number_delta(diff_text: str, delta: dict, context: int = DELTA_CONTEXT) -> s
     column that marks with ">" every line that is new or changed since the last reviewed commit
     (``delta``: changed_since of the push), cut down to those lines and ``context`` lines of their
     hunk on each side. A hunk without such a line is left out, a longer unchanged run inside a hunk
-    becomes one "... N lines left out ..." line, and a "~" line says where the push removed lines
-    that leave no trace in the PR's diff.
+    becomes one "... N lines left out ..." line, and a "~" line names a change of the push that left
+    no line to mark (_delta_section), so that none passes unseen.
 
     A further round used to read the whole section of every file the push touched, and a file that
     is new in the PR is one hunk: a fix of a few lines had the model read, and report on, hundreds
