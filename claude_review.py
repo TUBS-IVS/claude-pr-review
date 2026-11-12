@@ -391,17 +391,20 @@ STATUS_WORDS = {"A": "added", "D": "deleted", "R": "renamed", "C": "copied"}
 
 
 def _measure(config: dict, entries: list) -> tuple:
-    """(changed lines, changed files, critical paths, printable size) of numstat entries outside
-    the ignored paths."""
+    """(changed lines, changed files, critical paths, printable size, changed lines and changed
+    files outside the supporting paths) of numstat entries outside the ignored paths."""
     counted = [(path, lines) for path, lines in entries if not matches_any(path, config.get("ignored_paths", []))]
     changed_lines = sum(lines for _, lines in counted)
     # A structure path is always critical too (the structure paths are the backbone of the critical ones).
     critical_patterns = [*config.get("critical_paths", []), *config.get("structure_paths", [])]
     critical = sorted(path for path, _ in counted if matches_any(path, critical_patterns))
+    supporting = [lines for path, lines in counted if matches_any(path, config.get("supporting_paths", []))]
     size = f"{changed_lines} changed lines in {len(counted)} files"
+    if supporting:
+        size += f", {sum(supporting)} of them in {len(supporting)} supporting files"
     if critical:
         size += f", critical: {', '.join(critical[:5])}" + (f" (+{len(critical) - 5} more)" if len(critical) > 5 else "")
-    return changed_lines, len(counted), critical, size
+    return changed_lines, len(counted), critical, size, changed_lines - sum(supporting), len(counted) - len(supporting)
 
 
 def _structure(config: dict, entries: list, events) -> tuple:
@@ -417,10 +420,17 @@ def _structure(config: dict, entries: list, events) -> tuple:
 
 
 def _size_tier(config: dict, measured: tuple, structure: tuple, kind: str) -> tuple:
-    """(tier, why) from the size and structure rules shared by a first and a further round."""
+    """(tier, why) from the size and structure rules shared by a first and a further round.
+
+    The deep tier's size thresholds count only what lies outside ``supporting_paths`` (documentation,
+    tests): a long ADR or test file is reviewed, but its volume does not restructure a repository
+    (TUBS-IVS/eqasim-bs PR #553: 25 lines of code and 1119 lines of documentation were a deep
+    review). The full tier's thresholds and the structure rules count everything."""
     changed_lines, changed_files, critical = measured[:3]
+    core_lines, core_files = measured[4:6]
     structure_files, structure_lines, structure_changes = structure
     limits = config["thresholds"]
+    outside = " outside the supporting paths" if config.get("supporting_paths") else ""
     if kind in config.get("skip_kinds", []) and not critical:
         return "none", f"skipped: branch kind '{kind}/' touches no critical path"
     if structure_changes:
@@ -431,10 +441,10 @@ def _size_tier(config: dict, measured: tuple, structure: tuple, kind: str) -> tu
         return "deep", f"deep: >= {limits['deep_min_structure_files']} structure files changed"
     if structure_lines >= limits["deep_min_structure_lines"]:
         return "deep", f"deep: >= {limits['deep_min_structure_lines']} changed lines in structure files"
-    if changed_lines >= limits["deep_min_lines"]:
-        return "deep", f"deep: >= {limits['deep_min_lines']} changed lines"
-    if changed_files >= limits["deep_min_files"]:
-        return "deep", f"deep: >= {limits['deep_min_files']} changed files"
+    if core_lines >= limits["deep_min_lines"]:
+        return "deep", f"deep: >= {limits['deep_min_lines']} changed lines{outside}"
+    if core_files >= limits["deep_min_files"]:
+        return "deep", f"deep: >= {limits['deep_min_files']} changed files{outside}"
     if critical:
         return "full", "full: critical path touched"
     if changed_lines >= limits["full_min_lines"]:
@@ -548,7 +558,7 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 #: Every key the code reads, per section (None: a value, not a mapping). A misspelt key would
 #: otherwise be ignored and its rule would silently do nothing (e.g. no critical paths at all).
 CONFIG_KEYS = {"labels": ("force", "skip"), "skip_drafts": None, "critical_paths": None, "ignored_paths": None,
-               "structure_paths": None, "skip_kinds": None, "thresholds": THRESHOLD_KEYS,
+               "structure_paths": None, "supporting_paths": None, "skip_kinds": None, "thresholds": THRESHOLD_KEYS,
                "rereview": ("max_rounds", "verify_tier"), "tiers": TIER_NAMES,
                "review": ("prompt_file", "allowed_tools")}
 #: Keys a section may have but need not: a caller's config from before the key existed stays valid.
@@ -631,7 +641,7 @@ def config_problems(config, prompt_template, budgets: str = "") -> list:
         problems += [f"unknown key '{section}.{key}' (known: {', '.join(known)})"
                      for key in sorted(set(config[section]) - set(known))]
         problems += [f"'{section}.{key}' is missing" for key in keys if key not in config[section]]
-    for key in ("critical_paths", "ignored_paths", "structure_paths", "skip_kinds"):
+    for key in ("critical_paths", "ignored_paths", "structure_paths", "supporting_paths", "skip_kinds"):
         value = config.get(key, [])
         if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
             problems.append(f"'{key}' must be a list of non-empty strings")

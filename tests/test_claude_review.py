@@ -98,6 +98,55 @@ def test_classify_decides_tier_from_committed_config(entries, branch, labels, dr
     assert decision.reason
 
 
+# A caller that names its documentation and tests as supporting paths (optional key, new in v1.5.0).
+_SUPPORTING = {**CONFIG, "supporting_paths": ["docs/**", "tests/**", "**/*.md"]}
+
+
+@pytest.mark.parametrize("entries, events, tier, why", [
+    # TUBS-IVS/eqasim-bs PR #553: 25 lines of code and 1119 lines of documentation got the deep tier
+    ([("braunschweig/x.py", 25), ("docs/adr/0180.md", 1119)], [], "full", "full: critical path touched"),
+    # the same volume in code is still deep, also next to any amount of prose and tests
+    ([("scripts/report_x.py", 700), ("scripts/report_y.py", 300), ("docs/adr/0180.md", 500)], [], "deep",
+     "deep: >= 1000 changed lines outside the supporting paths"),
+    ([("scripts/report_x.py", 700), ("tests/test_report_x.py", 300)], [], "full", "full: >= 150 changed lines"),
+    # by files: 5 scripts and 20 notes are not a deep change, 25 scripts are
+    ([(f"scripts/r{i}.py", 4) for i in range(5)] + [(f"docs/codebase/notes/n{i}.md", 3) for i in range(20)], [],
+     "full", "full: >= 8 changed files"),
+    ([(f"scripts/r{i}.py", 4) for i in range(25)], [], "deep", "deep: >= 25 changed files outside the supporting paths"),
+    # supporting lines still count for the full tier: prose is reviewed, only not as a deep change
+    ([("docs/codebase/notes/n.md", 200)], [], "full", "full: >= 150 changed lines"),
+    # the structure rules name paths, whatever their size: a rule file is prose and its change is still deep
+    ([(".claude/rules/new.md", 12)], [("A", ".claude/rules/new.md")], "deep", "deep: structure changed"),
+    ([(".claude/rules/tests.md", 300)], [], "deep", "deep: >= 300 changed lines in structure files"),
+])
+def test_supporting_paths_do_not_make_a_change_deep_by_their_volume(entries, events, tier, why):
+    decision = cr.classify(_SUPPORTING, entries, "feature/i1-x", [], False, events=events)
+    assert decision.tier == tier and why in decision.reason, decision.reason
+
+
+def test_the_gate_reason_says_how_much_of_a_change_is_supporting_material():
+    decision = cr.classify(_SUPPORTING, [("braunschweig/x.py", 25), ("docs/adr/0180.md", 1119)], "feature/i1-x", [], False)
+    assert "1144 changed lines in 2 files, 1119 of them in 1 supporting files" in decision.reason
+    # a config without the key decides and words its reason as before
+    decision = cr.classify(CONFIG, [("braunschweig/x.py", 25), ("docs/adr/0180.md", 1119)], "feature/i1-x", [], False)
+    assert decision.tier == "deep" and "deep: >= 1000 changed lines (1144 changed lines in 2 files, critical" in decision.reason
+
+
+def test_supporting_paths_count_the_same_way_in_a_further_round():
+    # the push since the last complete round: a small fix and a long note
+    context = cr.RoundContext(automatic_rounds=1, open_findings=0, last_sha="c" * 40,
+                              changed_entries=[("braunschweig/x.py", 30), ("docs/adr/0180.md", 1100)])
+    push = ([("braunschweig/x.py", 400)], "fix/i1-x", [], False, "synchronize", "")
+    assert cr.classify(_SUPPORTING, *push, context=context).tier == "full"
+    assert cr.classify(CONFIG, *push, context=context).tier == "deep"
+
+
+def test_supporting_paths_are_an_optional_list_of_globs():
+    assert cr.config_problems(_SUPPORTING, _PROMPT, budgets=_BUDGETS) == []
+    problems = cr.config_problems({**CONFIG, "supporting_paths": "docs/**"}, _PROMPT, budgets=_BUDGETS)
+    assert any("'supporting_paths' must be a list of non-empty strings" in problem for problem in problems), problems
+
+
 def test_parse_numstat_handles_renames_and_binaries():
     text = "10\t2\tbraunschweig/a.py\n-\t-\tdocs/fig.png\n3\t1\tbraunschweig/{old => new}/b.py\n0\t0\tx.py => y.py\n"
     assert cr.parse_numstat(text) == [
