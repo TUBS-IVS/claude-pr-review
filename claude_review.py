@@ -7,10 +7,11 @@
         [--event-action labeled --event-label x]
     python claude_review.py review --config .github/claude-review.yml --tier full \
         --repo OWNER/NAME --pr 12 --sha <head sha> --out result.json [--diff-out .claude/review-pr.diff] \
-        [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N]
+        [--state state.json --interdiff-dir DIR --diff-source pr|interdiff|none --mode M --round N --effort E]
     python claude_review.py post --result result.json --repo OWNER/NAME --pr 12 \
         --tier full --sha <head sha> [--diff-file pr.diff] [--dry-run]
-    python claude_review.py outcome --execution-file result.json [--tier full] [--model m] [--json out.json]
+    python claude_review.py outcome --execution-file result.json [--tier full] [--model m] [--effort E] \
+        [--json out.json]
 
 All commands run from the root of the reviewed repository's checkout: the config path, the prompt
 file it names and the diff file are relative to it.
@@ -25,13 +26,16 @@ classify decides WITHOUT calling a model whether the review runs and at which ti
 ("light", "full" or "deep"), from the `git diff --numstat` and `--name-status` of the PR (how
 much changed, and whether files of the structure paths were added, deleted or renamed), its
 branch kind, labels and draft state, against the thresholds in the config. It prints the decision with its reason
-and, under GitHub Actions, writes run/tier/model/max_turns/reason to $GITHUB_OUTPUT and a
-line to $GITHUB_STEP_SUMMARY, so a skipped review is never silent.
+and, under GitHub Actions, writes run/tier/model/max_turns/effort/reason to $GITHUB_OUTPUT and a
+line to $GITHUB_STEP_SUMMARY, so a skipped review is never silent. On a PR the review has seen before
+it gates the push alone (the `state` and `interdiff` commands say what was reviewed and what changed
+since), and a small push is only checked.
 
 review runs `claude -p` (Claude Code in print mode) with the API key in ANTHROPIC_API_KEY,
 the tier's model, turn and budget limits, read-only tools and a JSON schema for the findings,
 and writes the CLI's JSON result to --out. It hands the model the PR diff with the new-file
-line number in front of every line, so the model can cite lines GitHub accepts. Why it runs
+line number in front of every line, so the model can cite lines GitHub accepts; on a further round
+the diff is cut down to the lines that changed since the last reviewed commit. Why it runs
 `claude -p` and not anthropics/claude-code-action: see the note below. The model only reads;
 posting is done here.
 
@@ -191,21 +195,37 @@ def strip_state(body: str) -> str:
     return body if span is None else body[:span[0]] + body[span[1]:]
 
 
-def last_complete_sha(state: dict) -> str:
-    """Commit of the newest round that reviewed everything it set out to (else ""). A stale round
-    (a slow run of a commit that was no longer the head when it posted) is skipped: it is newer
-    in the list but older in the history, and the next interdiff would re-review files again."""
-    for round_ in reversed(state["rounds"]):
-        if round_.get("complete") and not round_.get("stale"):
-            return str(round_.get("sha", ""))
-    return ""
+def complete_shas(state: dict) -> list:
+    """Commits of the rounds that reviewed everything they set out to, in the order they posted."""
+    return [str(round_["sha"]) for round_ in state["rounds"] if round_.get("complete") and round_.get("sha")]
+
+
+def reviewed_commit(state: dict, distance) -> str:
+    """The commit a further round starts from: of the rounds that reviewed everything they set out
+    to, the one whose commit is the newest ancestor of head ("" when there is none).
+    ``distance(sha)`` gives the number of commits between that commit and head, or None when it is
+    no ancestor of head (rebase, force-push).
+
+    The history decides, neither the order in which the rounds posted nor ``stale``. A round is
+    stale when a push arrived while its review still ran; that review still read its whole commit,
+    so the next round reads only what came after it. Skipping stale rounds made every such push a
+    review of the whole PR again, on the tier of the first round (TUBS-IVS/eqasim-bs PR #571, #582,
+    #607). A slow run of an older commit that posts after a newer round is further from head and so
+    never the base, which is what ``stale`` was read for before v1.5.0."""
+    best = None
+    for sha in complete_shas(state):
+        commits = distance(sha)
+        # "<=": of two commits equally far from head (unrelated histories) the round posted last wins.
+        if commits is not None and (best is None or commits <= best[0]):
+            best = (commits, sha)
+    return best[1] if best else ""
 
 
 def automatic_rounds(state: dict) -> int:
     """Rounds that count against rereview.max_rounds: every automatic round that called the model
     (``model_call``: the API reported a cost above zero), complete or not. A forced round and a round
     without a model call do not use one up. ``complete`` only decides whether the reviewed commit
-    moves (last_complete_sha): counting complete rounds only would let a PR the model never reads in
+    moves (reviewed_commit): counting complete rounds only would let a PR the model never reads in
     full be reviewed on every push without limit (Claude review finding on PR #521)."""
     return sum(1 for r in state["rounds"] if r.get("automatic") and r.get("model_call"))
 
@@ -277,6 +297,7 @@ class Decision:
     mode: str = "first"  # "first", "rereview", "verify", "forced" or "none"
     diff_source: str = "pr"  # what the model reads: "pr" (whole PR), "interdiff" or "none"
     round: int = 1
+    effort: str = ""  # the effort level of the run; "" for the model's default
 
 
 @dataclass
@@ -375,17 +396,20 @@ STATUS_WORDS = {"A": "added", "D": "deleted", "R": "renamed", "C": "copied"}
 
 
 def _measure(config: dict, entries: list) -> tuple:
-    """(changed lines, changed files, critical paths, printable size) of numstat entries outside
-    the ignored paths."""
+    """(changed lines, changed files, critical paths, printable size, changed lines and changed
+    files outside the supporting paths) of numstat entries outside the ignored paths."""
     counted = [(path, lines) for path, lines in entries if not matches_any(path, config.get("ignored_paths", []))]
     changed_lines = sum(lines for _, lines in counted)
     # A structure path is always critical too (the structure paths are the backbone of the critical ones).
     critical_patterns = [*config.get("critical_paths", []), *config.get("structure_paths", [])]
     critical = sorted(path for path, _ in counted if matches_any(path, critical_patterns))
+    supporting = [lines for path, lines in counted if matches_any(path, config.get("supporting_paths", []))]
     size = f"{changed_lines} changed lines in {len(counted)} files"
+    if supporting:
+        size += f", {sum(supporting)} of them in {len(supporting)} supporting files"
     if critical:
         size += f", critical: {', '.join(critical[:5])}" + (f" (+{len(critical) - 5} more)" if len(critical) > 5 else "")
-    return changed_lines, len(counted), critical, size
+    return changed_lines, len(counted), critical, size, changed_lines - sum(supporting), len(counted) - len(supporting)
 
 
 def _structure(config: dict, entries: list, events) -> tuple:
@@ -401,10 +425,17 @@ def _structure(config: dict, entries: list, events) -> tuple:
 
 
 def _size_tier(config: dict, measured: tuple, structure: tuple, kind: str) -> tuple:
-    """(tier, why) from the size and structure rules shared by a first and a further round."""
+    """(tier, why) from the size and structure rules shared by a first and a further round.
+
+    The deep tier's size thresholds count only what lies outside ``supporting_paths`` (documentation,
+    tests): a long ADR or test file is reviewed, but its volume does not restructure a repository
+    (TUBS-IVS/eqasim-bs PR #553: 25 lines of code and 1119 lines of documentation were a deep
+    review). The full tier's thresholds and the structure rules count everything."""
     changed_lines, changed_files, critical = measured[:3]
+    core_lines, core_files = measured[4:6]
     structure_files, structure_lines, structure_changes = structure
     limits = config["thresholds"]
+    outside = " outside the supporting paths" if config.get("supporting_paths") else ""
     if kind in config.get("skip_kinds", []) and not critical:
         return "none", f"skipped: branch kind '{kind}/' touches no critical path"
     if structure_changes:
@@ -415,10 +446,10 @@ def _size_tier(config: dict, measured: tuple, structure: tuple, kind: str) -> tu
         return "deep", f"deep: >= {limits['deep_min_structure_files']} structure files changed"
     if structure_lines >= limits["deep_min_structure_lines"]:
         return "deep", f"deep: >= {limits['deep_min_structure_lines']} changed lines in structure files"
-    if changed_lines >= limits["deep_min_lines"]:
-        return "deep", f"deep: >= {limits['deep_min_lines']} changed lines"
-    if changed_files >= limits["deep_min_files"]:
-        return "deep", f"deep: >= {limits['deep_min_files']} changed files"
+    if core_lines >= limits["deep_min_lines"]:
+        return "deep", f"deep: >= {limits['deep_min_lines']} changed lines{outside}"
+    if core_files >= limits["deep_min_files"]:
+        return "deep", f"deep: >= {limits['deep_min_files']} changed files{outside}"
     if critical:
         return "full", "full: critical path touched"
     if changed_lines >= limits["full_min_lines"]:
@@ -453,11 +484,18 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
         prefix += (f"round {round_number}, {context.automatic_rounds}/{rereview['max_rounds']} automatic rounds used, "
                    f"{context.open_findings} open finding(s), since {context.last_sha[:12]}: ")
 
-    def decide(tier: str, why: str, mode: str, diff_source: str, size: str = measured[3]) -> Decision:
+    def decide(tier: str, why: str, mode: str, diff_source: str, size: str = measured[3],
+               check: bool = False) -> Decision:
         run = tier != "none"
+        # A check (every verify round, and a small push) runs at `rereview.verify_effort` when the
+        # config sets one. Every other run, and a check without that key, runs at the effort of its tier.
+        effort = ""
+        if run:
+            effort = str((rereview.get("verify_effort") if check or mode == "verify" else None)
+                         or tiers[tier].get("effort") or "")
         return Decision(run, tier, tiers[tier]["model"] if run else "", int(tiers[tier]["max_turns"]) if run else 0,
                         f"{prefix}{why} ({size})", measured[0], measured[1], measured[2],
-                        mode if run else "none", diff_source if run else "none", round_number)
+                        mode if run else "none", diff_source if run else "none", round_number, effort)
 
     if label_cfg["skip"] in labels:
         return decide("none", f"skipped: label '{label_cfg['skip']}' is set", "none", "none")
@@ -507,6 +545,22 @@ def classify(config: dict, entries: list, branch: str, labels: list, draft: bool
     if tier == "none" and context.open_findings:
         return decide(verify, f"verify: {context.open_findings} open finding(s), the push itself is not reviewed ({why})",
                       "verify", "interdiff")
+    # A small push is a check, not another review: the first-round rules would put nearly every fix
+    # on the full tier, because nearly all code of a repository is a critical path, however few lines
+    # it changes (`rereview.small_push_lines`, optional). A structure change is never small, and the
+    # check never runs on a higher tier than the rules give the push.
+    # The lines of a push say nothing about a file it took out of the PR (`reverted`: what the file
+    # held may still be used) or about a file without countable lines (binary), so neither is small.
+    limit = rereview.get("small_push_lines")
+    unmeasured = context.reverted or [path for path, lines in context.changed_entries
+                                      if not lines and not matches_any(path, config.get("ignored_paths", []))]
+    if (tier != "none" and limit is not None and measured[0] <= int(limit) and not structure[2]
+            and not unmeasured):
+        if TIER_NAMES.index(verify) < TIER_NAMES.index(tier):
+            return decide(verify, f"{verify}: a small push (at most {limit} changed lines) is checked on the verify "
+                                  f"tier instead of {why}", "rereview", "interdiff", check=True)
+        return decide(tier, f"{why}, checked as a small push (at most {limit} changed lines)", "rereview", "interdiff",
+                      check=True)
     return decide(tier, why, "rereview", "interdiff")
 
 
@@ -532,11 +586,11 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 #: Every key the code reads, per section (None: a value, not a mapping). A misspelt key would
 #: otherwise be ignored and its rule would silently do nothing (e.g. no critical paths at all).
 CONFIG_KEYS = {"labels": ("force", "skip"), "skip_drafts": None, "critical_paths": None, "ignored_paths": None,
-               "structure_paths": None, "skip_kinds": None, "thresholds": THRESHOLD_KEYS,
+               "structure_paths": None, "supporting_paths": None, "skip_kinds": None, "thresholds": THRESHOLD_KEYS,
                "rereview": ("max_rounds", "verify_tier"), "tiers": TIER_NAMES,
                "review": ("prompt_file", "allowed_tools")}
 #: Keys a section may have but need not: a caller's config from before the key existed stays valid.
-OPTIONAL_KEYS = {"rereview": ("verify_after_cap",)}
+OPTIONAL_KEYS = {"rereview": ("verify_after_cap", "small_push_lines", "verify_effort")}
 #: Placeholders a prompt must contain: where the diff is, and the open findings of earlier rounds.
 REQUIRED_PLACEHOLDERS = ("DIFF_BLOCK", "ROUND_BLOCK")
 
@@ -615,7 +669,7 @@ def config_problems(config, prompt_template, budgets: str = "") -> list:
         problems += [f"unknown key '{section}.{key}' (known: {', '.join(known)})"
                      for key in sorted(set(config[section]) - set(known))]
         problems += [f"'{section}.{key}' is missing" for key in keys if key not in config[section]]
-    for key in ("critical_paths", "ignored_paths", "structure_paths", "skip_kinds"):
+    for key in ("critical_paths", "ignored_paths", "structure_paths", "supporting_paths", "skip_kinds"):
         value = config.get(key, [])
         if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
             problems.append(f"'{key}' must be a list of non-empty strings")
@@ -662,6 +716,12 @@ def config_problems(config, prompt_template, budgets: str = "") -> list:
         problems.append(f"'rereview.verify_tier' must be one of {', '.join(TIER_NAMES)}, got {rereview['verify_tier']!r}")
     if "verify_after_cap" in rereview and not (_whole(rereview["verify_after_cap"]) and rereview["verify_after_cap"] >= 0):
         problems.append(f"'rereview.verify_after_cap' must be a whole number >= 0, got {rereview['verify_after_cap']!r}")
+    if "small_push_lines" in rereview and not (_whole(rereview["small_push_lines"]) and rereview["small_push_lines"] >= 0):
+        problems.append(f"'rereview.small_push_lines' must be a whole number >= 0, got {rereview['small_push_lines']!r}")
+    if "verify_effort" in rereview and rereview["verify_effort"] not in EFFORT_LEVELS:
+        # As for a tier's effort: the CLI would only warn and run at the default.
+        problems.append(f"'rereview.verify_effort' must be one of {', '.join(EFFORT_LEVELS)}, "
+                        f"got {rereview['verify_effort']!r}")
     review = _mapping(config, "review")
     if "allowed_tools" in review:
         tools = review["allowed_tools"]
@@ -741,21 +801,40 @@ def build_prompt(template: str, values: dict, verbatim: dict | None = None) -> s
     return prompt
 
 
-def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, ignored=()) -> str:
+def diff_block(diff_source: str, diff_file: str, changed: list, reverted: list, ignored=(),
+               delta: bool = False) -> str:
     """The prompt paragraph that says what the model reads: the whole PR diff, the files changed
     since the last complete round, or no diff at all (only open findings to verify). ``ignored``
     names the changed files left out of the diff as ignored paths, so an undeclared change to one
-    of them (a regenerated input, say) can still be held against the PR description."""
+    of them (a regenerated input, say) can still be held against the PR description. ``delta``:
+    the diff file is number_delta's, cut down to what changed since the last reviewed commit."""
     reading = ("Read ALL of it with Read, page by page (offset/limit) when it is long, before you conclude. "
                "Left of the `|` every added (`+`) and context (` `) line carries its line number in the NEW "
                "version of the file; deleted (`-`) lines and headers carry none.")
+    # A file the push took out of the PR may leave its users behind, in hunks that did not change.
     gone = (f" These files were in the PR's change at the last reviewed commit and are not any more "
-            f"(reverted to main or renamed): {', '.join(reverted)}." if reverted else "")
+            f"(reverted to main or renamed): {', '.join(reverted)}. Check that nothing left in the PR still relies "
+            "on what they held." if reverted else "")
     left_out = (f" These changed files are left out of the diff as ignored paths (generated, binary or "
                 f"machine-written): {', '.join(ignored)}. Check against the PR description that their change "
                 f"is declared." if ignored else "")
     if diff_source == "pr":
         return f"The complete diff of the PR is in the file {diff_file}. {reading}{left_out}"
+    if diff_source == "interdiff" and delta:
+        return (f"This is a further round. The file {diff_file} holds the PR's diff against main for only "
+                f"the files whose change differs from the last reviewed commit ({', '.join(changed)}), cut down "
+                "to what changed since then. A line that starts with `>` is new or changed since the last "
+                "reviewed commit. The unmarked lines around it are context that an earlier round reviewed. A "
+                "line whose text starts with `~` is a note on a change that left no line to mark: where lines "
+                "were removed, where else the file changed, or why a hunk or a file is shown whole. A line `... N "
+                "lines left out ...` or `... N hunks left out ...` stands for an unchanged part, which you can open "
+                "in the file itself with Read. "
+                f"{reading} Review the changes marked `>` and `~`: whether each one is right, and whether it "
+                "breaks the code around it or code elsewhere. Report nothing about an unmarked line unless a "
+                "marked change makes it wrong or the defect is of high severity. The other files of the PR were "
+                "reviewed before and did not change. The parts left out were reviewed before too: you have read "
+                "the whole diff (`coverage_complete` true) when you have read every line of this file, whether "
+                f"or not you opened a left-out part.{gone}{left_out}")
     if diff_source == "interdiff":
         return (f"This is a further round. The file {diff_file} holds the PR's diff against main for only "
                 f"the files whose change differs from the last reviewed commit: {', '.join(changed)}. "
@@ -790,6 +869,12 @@ def round_block(state: dict, mode: str, round_number: int, moved: bool = False) 
     return "\n".join(lines)
 
 
+def has_delta(meta: dict) -> bool:
+    """True when `interdiff` recorded what the push changed (``delta``), so the model reads
+    number_delta's diff; the prompt and the diff file must agree on this."""
+    return isinstance(meta.get("delta"), dict)
+
+
 def fence_for(text: str) -> str:
     """A backtick fence longer than the longest backtick run in ``text`` (at least four), so the
     text cannot close it."""
@@ -806,17 +891,19 @@ def review_prompt(template: str, repo: str, pr: int, tier: str, sha: str, diff_s
     body = body.strip() or "(empty)"
     values = {"REPO": repo, "PR": str(pr), "TIER": tier, "SHA": sha, "FENCE": fence_for(body),
               "DIFF_BLOCK": diff_block(diff_source, diff_file, meta.get("changed", []), meta.get("reverted", []),
-                                       ignored)}
+                                       ignored, delta=has_delta(meta))}
     verbatim = {"PR_TITLE": " ".join(str(title).split()), "PR_BODY": body,
                 "ROUND_BLOCK": round_block(state, mode, round_number, moved=bool(meta.get("fallback")))}
     return build_prompt(template, values, verbatim)
 
 
-def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_usd: float) -> list:
-    """The `claude -p` call of one review run; ``budget_usd`` is the tier's hard budget (tier_budget)."""
-    # The tier's effort level, when the config sets one (check-config has validated it); without
-    # it the CLI applies the model's default.
-    effort = ["--effort", str(tier_cfg["effort"])] if tier_cfg.get("effort") else []
+def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_usd: float, effort: str = "") -> list:
+    """The `claude -p` call of one review run; ``budget_usd`` is the tier's hard budget (tier_budget),
+    ``effort`` the level the gate decided for this run (a check runs at its own)."""
+    # The gate's effort, else the tier's, when the config sets one (check-config has validated both);
+    # without any the CLI applies the model's default.
+    level = effort or tier_cfg.get("effort")
+    effort = ["--effort", str(level)] if level else []
     return [
         claude_bin, "-p",
         # --bare: authenticate strictly with ANTHROPIC_API_KEY (never a Claude plan login, so the
@@ -835,6 +922,44 @@ def claude_command(claude_bin: str, tier_cfg: dict, allowed_tools: list, budget_
     ]
 
 
+def _hunk_counts(raw: str) -> tuple:
+    """(number of old lines, first new line, number of new lines) of a hunk header line."""
+    match = re.match(r"@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", raw)
+    if not match:
+        raise ValueError(f"unparsable hunk header: {raw!r}")
+    return (int(match.group(1)) if match.group(1) is not None else 1, int(match.group(2)),
+            int(match.group(3)) if match.group(3) is not None else 1)
+
+
+def _walk(diff_text: str):
+    """walk_diff with a fourth value: True for a line inside a hunk, False for a header line (a
+    line "@@ ..." outside a hunk is a hunk header; inside one it could only be content)."""
+    path = None
+    new_line = old_left = new_left = 0
+    for raw in git_lines(diff_text):
+        if old_left > 0 or new_left > 0:
+            # A context line of an empty source line may arrive as "" when trailing blanks are stripped.
+            if raw.startswith("+"):
+                yield raw, path, new_line, True
+                new_line, new_left = new_line + 1, new_left - 1
+            elif raw.startswith(" ") or raw == "":
+                yield raw, path, new_line, True
+                new_line, new_left, old_left = new_line + 1, new_left - 1, old_left - 1
+            else:
+                if raw.startswith("-"):
+                    old_left -= 1
+                yield raw, path, None, True
+            continue
+        if raw.startswith("diff --git "):
+            path = None
+        elif raw.startswith("+++ "):
+            target = raw[4:].strip()
+            path = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
+        elif raw.startswith("@@"):
+            old_left, new_line, new_left = _hunk_counts(raw)
+        yield raw, path, None, False
+
+
 def walk_diff(diff_text: str):
     """Yield ``(raw line, path, new-side line number or None)`` for every line of a unified diff.
 
@@ -843,35 +968,8 @@ def walk_diff(diff_text: str):
     ends when the line counts of its header are used up; only then are header lines read, so an
     added line "++ x" (shown as "+++ x") is content, not a "+++ b/file" header (Claude review
     finding on PR #497)."""
-    path = None
-    new_line = old_left = new_left = 0
-    for raw in git_lines(diff_text):
-        if old_left > 0 or new_left > 0:
-            # A context line of an empty source line may arrive as "" when trailing blanks are stripped.
-            if raw.startswith("+"):
-                yield raw, path, new_line
-                new_line, new_left = new_line + 1, new_left - 1
-            elif raw.startswith(" ") or raw == "":
-                yield raw, path, new_line
-                new_line, new_left, old_left = new_line + 1, new_left - 1, old_left - 1
-            else:
-                if raw.startswith("-"):
-                    old_left -= 1
-                yield raw, path, None
-            continue
-        if raw.startswith("diff --git "):
-            path = None
-        elif raw.startswith("+++ "):
-            target = raw[4:].strip()
-            path = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target)
-        elif raw.startswith("@@"):
-            match = re.match(r"@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", raw)
-            if not match:
-                raise ValueError(f"unparsable hunk header: {raw!r}")
-            old_left = int(match.group(1)) if match.group(1) is not None else 1
-            new_line = int(match.group(2))
-            new_left = int(match.group(3)) if match.group(3) is not None else 1
-        yield raw, path, None
+    for raw, path, number, _ in _walk(diff_text):
+        yield raw, path, number
 
 
 def commentable_lines(diff_text: str) -> dict:
@@ -892,6 +990,225 @@ def number_diff(diff_text: str) -> str:
     for raw, _, number in walk_diff(diff_text):
         out.append(f"{number:>6} |{raw}" if number is not None else f"{'':>6} |{raw}")
     return "\n".join(out) + ("\n" if out else "")
+
+
+#: Lines of a hunk shown on each side of a change in the diff of a further round (number_delta). A
+#: hunk of the PR's diff can be a whole new file; for more the model opens the file itself.
+#: ASSUMPTION: 30 lines show the function around a typical fix; not measured.
+DELTA_CONTEXT = 30
+#: A run of unchanged lines up to this length is shown: a one-line placeholder would save nothing.
+DELTA_SHOWN_RUN = 3
+_UNCHANGED = "unchanged since the last reviewed commit"
+
+
+def changed_since(diff_text: str) -> dict:
+    """What a push changed, per file, read from `git diff -U0 <reviewed commit> <head>`: for every
+    hunk ``[first new line, number of new lines, number of old lines]``. The new lines are new or
+    changed lines of the file at head. A hunk with old lines removed them right before its first
+    new line or, when it has no new lines, right after the line it names. A deleted file is keyed
+    by its old path, as in split_sections."""
+    hunks: dict = {}
+    for path, text in split_sections(diff_text):
+        if not path:
+            continue
+        for raw, _, _, inside in _walk(text):
+            if not inside and raw.startswith("@@"):
+                old_count, new_start, new_count = _hunk_counts(raw)
+                hunks.setdefault(path, []).append([new_start, new_count, old_count])
+    return hunks
+
+
+def _delta_line(mark: str, number, text: str) -> str:
+    return f"{mark}{number if number is not None else '':>6} |{text}"
+
+
+def _section_hunks(text: str) -> tuple:
+    """(header lines, hunks) of one file section of a unified diff; a hunk is
+    ``[header line, [[raw line, new-side line number or None, mark], ...]]``."""
+    headers, hunks = [], []
+    for raw, _, number, inside in _walk(text):
+        if inside or (hunks and raw.startswith("\\")):
+            hunks[-1][1].append([raw, number, ""])
+        elif raw.startswith("@@"):
+            hunks.append([raw, []])
+        else:
+            headers.append(raw)
+    return headers, hunks
+
+
+def _delta_section(text: str, changes, then_text: str, context: int) -> tuple:
+    """(lines, counts) of number_delta for one file section. ``changes`` are that file's hunks from
+    changed_since, or None when git named no changed line of it; ``then_text`` is the file's section
+    of the PR's diff at the last reviewed commit ("" when it had none)."""
+    headers, hunks = _section_hunks(text)
+    out = [_delta_line(" ", None, raw) for raw in headers]
+    counts = {"marked": 0, "notes": 0, "hunks_left_out": 0, "whole": 0}
+    if changes is None:
+        # A binary file or a mode change: nothing can be cut away safely, so nothing is.
+        out.append(_delta_line(" ", None, "~ no changed line of this file is known since the last reviewed commit: "
+                                          "its whole section follows"))
+        counts.update(notes=1, whole=1)
+        for header, lines in hunks:
+            out.append(_delta_line(" ", None, header))
+            out += [_delta_line(" ", number, raw) for raw, number, _ in lines]
+        return out, counts
+    reviewed = _section_hunks(then_text)[1]
+    reviewed_hunks = {tuple(raw for raw, _, _ in lines) for _, lines in reviewed}
+    reviewed_removals = {raw for _, lines in reviewed for raw, number, _ in lines
+                         if number is None and raw.startswith("-")}
+    reviewed_additions = {raw for _, lines in reviewed for raw, number, _ in lines
+                          if number is not None and raw.startswith("+")}
+    added = {line for start, count, _ in changes for line in range(start, start + count)}
+    # Where old lines went: right after this line of the file at head.
+    removed_after = {start if count == 0 else start - 1 for start, count, old in changes if old}
+    visible = {number for _, lines in hunks for _, number, _ in lines if number is not None}
+    shown_removals = set()
+    for header, lines in hunks:
+        _, new_start, new_count = _hunk_counts(header)
+        position = new_start if new_count == 0 else new_start - 1  # the new-side line a deleted line follows
+        for line in lines:
+            raw, number = line[0], line[1]
+            if number is not None:
+                position = number
+                # An added line, or a context line: one that the push changed back to the base branch's.
+                if number in added:
+                    line[2] = ">"
+            elif raw.startswith("-") and position in removed_after:
+                # A line of the base branch the push deleted (with it, deletions made there before:
+                # git does not say which of the deleted lines at this place are the push's).
+                line[2] = ">"
+                shown_removals.add(position)
+            elif raw.startswith("-") and raw not in reviewed_removals:
+                # A deletion no earlier round saw: the base branch changed the line the PR removes (a
+                # merge), so what the PR does here changed although no line of it did at head.
+                line[2] = ">"
+            if number is not None and raw.startswith("+") and raw not in reviewed_additions:
+                # An addition no earlier round saw, although the line itself is old: the base branch
+                # dropped it (a merge), so the PR now adds it back.
+                line[2] = ">"
+    # A hunk that removes lines and is not, line for line, a hunk an earlier round read is never cut
+    # down and never left out: what it removes can change without a changed line at head, and a
+    # removed line that reads like another one was (a blank line, "pass") cannot be told apart by
+    # its text. Decided before the notes below are put between the lines.
+    # A hunk without removed lines that no round read is not left out either (a merge can make a line the
+    # PR keeps an addition: main dropped it); it is shown whole when nothing in it can be marked.
+    unreviewed = [tuple(raw for raw, _, _ in lines) not in reviewed_hunks for _, lines in hunks]
+    whole = [new and (any(number is None and raw.startswith("-") for raw, number, _ in lines)
+                      or not any(line[2] for line in lines))
+             for new, (_, lines) in zip(unreviewed, hunks)]
+    # Every change of the push leaves a trace: a part of the PR's change that was taken back would
+    # otherwise pass unseen, and the code that used it may still be there. Lines the PR had added and
+    # the push removed leave no line in the PR's diff, so a note stands where they stood; a change
+    # where the PR's diff has no hunk (the file is as on the base branch there) is named by its line.
+    elsewhere = []
+    for start, count, _ in changes:
+        if count:
+            # The first line of each part of the change that no hunk shows; the rest of it is marked.
+            hidden = False
+            for line in range(start, start + count):
+                if line in visible:
+                    hidden = False
+                elif not hidden:
+                    elsewhere.append(line)
+                    hidden = True
+            continue
+        if start in shown_removals:
+            continue
+        note = ["~ lines were removed here since the last reviewed commit", None, "~"]
+        for _, lines in hunks:
+            numbers = [line[1] for line in lines]
+            if start + 1 in numbers:
+                lines.insert(numbers.index(start + 1), note)
+                break
+            if start in numbers:
+                lines.insert(numbers.index(start) + 1, note)
+                break
+        else:
+            elsewhere.append(max(start, 1))  # a removal at the top of the file is named by its first line
+    if elsewhere:
+        places = ", ".join(str(line) for line in elsewhere[:10]) + (f" (+{len(elsewhere) - 10} more)"
+                                                                   if len(elsewhere) > 10 else "")
+        out.append(_delta_line(" ", None, f"~ since the last reviewed commit this file also changed at line {places}, "
+                                          "where it is as on the base branch now (a change of the base branch, or a "
+                                          "part of the PR's change that was taken back): open the file to see it"))
+        counts["notes"] += 1
+
+    def shown(line: list) -> str:
+        return _delta_line(">" if line[2] == ">" else " ", line[1], line[0])
+
+    def left_out_hunks(count: int) -> str:
+        return _delta_line(" ", None, f"... {count} hunk{'' if count == 1 else 's'} left out: {_UNCHANGED} ...")
+
+    dropped = 0
+    for (header, lines), all_of_it in zip(hunks, whole):
+        anchors = [index for index, line in enumerate(lines) if line[2]]
+        if not anchors and not all_of_it:
+            dropped += 1
+            continue
+        if dropped:
+            out.append(left_out_hunks(dropped))
+            counts["hunks_left_out"] += dropped
+            dropped = 0
+        out.append(_delta_line(" ", None, header))
+        counts["marked"] += sum(line[2] == ">" for line in lines)
+        counts["notes"] += sum(line[2] == "~" for line in lines)
+        if not anchors:
+            out.append(_delta_line(" ", None, "~ this hunk is not as an earlier round reviewed it, although no line of "
+                                              "it changed at head (a merge of the base branch, or its borders moved): "
+                                              "read it whole"))
+            counts["notes"] += 1
+        keep = [all_of_it] * len(lines)
+        for anchor in anchors:
+            for index in range(max(0, anchor - context), min(len(lines), anchor + context + 1)):
+                keep[index] = True
+        index = 0
+        while index < len(lines):
+            end = index
+            while end < len(lines) and not keep[end]:
+                end += 1
+            run = lines[index:end]
+            if len(run) > DELTA_SHOWN_RUN:
+                numbers = [number for _, number, _ in run if number is not None]
+                where = f" (lines {numbers[0]}-{numbers[-1]} of the file)" if numbers else ""
+                out.append(_delta_line(" ", None, f"... {len(run)} lines left out: {_UNCHANGED}{where} ..."))
+            else:
+                out += [shown(line) for line in run]
+            if end < len(lines):
+                out.append(shown(lines[end]))
+            index = end + 1
+    if dropped:
+        out.append(left_out_hunks(dropped))
+        counts["hunks_left_out"] += dropped
+    return out, counts
+
+
+def _delta_view(diff_text: str, delta: dict, then_text: str, context: int = DELTA_CONTEXT) -> tuple:
+    """(text, counts) of number_delta: the counts say how much was cut away and how much could not
+    be (marked lines, notes, hunks left out, files shown whole), for the log of the run."""
+    then = {path: text for path, text in split_sections(then_text) if path}
+    out, totals = [], {"marked": 0, "notes": 0, "hunks_left_out": 0, "whole": 0}
+    for path, text in split_sections(diff_text):
+        lines, counts = _delta_section(text, delta.get(path) if path else None, then.get(path, ""), context)
+        out += lines
+        for key, value in counts.items():
+            totals[key] += value
+    return "\n".join(out) + ("\n" if out else ""), totals
+
+
+def number_delta(diff_text: str, delta: dict, then_text: str, context: int = DELTA_CONTEXT) -> str:
+    """The diff of a further round as the model reads it: number_diff's line numbers behind a
+    column that marks with ">" every line that is new or changed since the last reviewed commit
+    (``delta``: changed_since of the push), cut down to those lines and ``context`` lines of their
+    hunk on each side. A hunk without such a line is left out, a longer unchanged run inside a hunk
+    becomes one "... N lines left out ..." line, and a "~" line names a change of the push that left
+    no line to mark, so that none passes unseen. ``then_text`` is the PR's diff of the same files at
+    the last reviewed commit: a hunk that removes lines is left out or cut down only when an earlier
+    round read exactly that hunk (_delta_section).
+
+    A further round used to read the whole section of every file the push touched, and a file that
+    is new in the PR is one hunk: a fix of a few lines had the model read, and report on, hundreds
+    of lines an earlier round had reviewed. The raw diff that `post` places findings on stays whole."""
+    return _delta_view(diff_text, delta, then_text, context)[0]
 
 
 def read_findings(result: dict) -> dict:
@@ -1196,6 +1513,14 @@ def _is_ancestor(older: str, newer: str) -> bool:
     return subprocess.run(["git", "merge-base", "--is-ancestor", older, newer], capture_output=True).returncode == 0
 
 
+def _commits_between(older: str, newer: str):
+    """The number of commits from ``older`` to ``newer``, or None when ``older`` is no ancestor of
+    ``newer`` (a rebase or force-push, or a commit this checkout does not have)."""
+    if not _is_ancestor(older, newer):
+        return None
+    return int(_git(["rev-list", "--count", f"{older}..{newer}"]).strip())
+
+
 def _gh_api(args: list, payload: dict | None = None) -> str:
     command = ["gh", "api", *args]
     if payload is None:
@@ -1300,9 +1625,10 @@ def _cmd_classify(args) -> int:
                         args.event_action or "", args.event_label or "", context, events)
     print(f"[claude-review] {decision.reason}")
     print(f"[claude-review] run={str(decision.run).lower()} tier={decision.tier} model={decision.model or '-'} "
+          f"effort={decision.effort or ('default' if decision.run else '-')} "
           f"mode={decision.mode} diff={decision.diff_source} round={decision.round}")
     _append("GITHUB_OUTPUT", f"run={str(decision.run).lower()}\ntier={decision.tier}\nmodel={decision.model}\n"
-                             f"max_turns={decision.max_turns}\nmode={decision.mode}\n"
+                             f"max_turns={decision.max_turns}\neffort={decision.effort}\nmode={decision.mode}\n"
                              f"diff_source={decision.diff_source}\nround={decision.round}\nreason={decision.reason}\n")
     _append("GITHUB_STEP_SUMMARY", f"### Claude review gate\n\n- Decision: **{decision.tier}** "
                                    f"(round {decision.round}, mode {decision.mode})\n"
@@ -1327,9 +1653,10 @@ def _cmd_state(args) -> int:
         state = refresh_state(state, _fetch_threads(args.repo, args.pr))
     counts = {status: sum(1 for f in state["findings"] if f.get("status") == status)
               for status in ("open", "resolved", "dismissed")}
-    print(f"[claude-review] state: {len(state['rounds'])} rounds ({automatic_rounds(state)} automatic complete), "
-          f"open {counts['open']}, resolved {counts['resolved']}, dismissed {counts['dismissed']}, "
-          f"last complete {last_complete_sha(state)[:12] or '-'}")
+    # Which complete round the next one starts from is the interdiff's decision: it needs the history.
+    print(f"[claude-review] state: {len(state['rounds'])} rounds ({automatic_rounds(state)} automatic with a model "
+          f"call, {len(complete_shas(state))} complete), open {counts['open']}, resolved {counts['resolved']}, "
+          f"dismissed {counts['dismissed']}")
     Path(args.out).write_text(json.dumps(state, indent=2), encoding="utf-8")
     return 0
 
@@ -1341,13 +1668,15 @@ def _cmd_interdiff(args) -> int:
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     ignored = config.get("ignored_paths", [])
     state = json.loads(Path(args.state).read_text(encoding="utf-8"))
-    last = last_complete_sha(state)
     base, head = args.base_sha, args.head_sha
+    last = reviewed_commit(state, lambda sha: _commits_between(sha, head))
     full_now = _git(["diff", f"{base}...{head}"])
     now, ignored_changed = filter_diff(full_now, ignored)
     fallback = ""
     result = None
-    if last and not _is_ancestor(last, head):
+    if not last and complete_shas(state):
+        # Rounds exist, but none of their commits is in the history of head any more.
+        last = complete_shas(state)[-1]
         fallback = (f"reviewed commit {last[:12]} is not an ancestor of head (rebase or force-push?); "
                     "the whole PR is reviewed")
         print(f"[claude-review] fallback: {fallback}")
@@ -1372,19 +1701,30 @@ def _cmd_interdiff(args) -> int:
     # reviewed as such). Paths, not whole events, are compared: git's rename pairing (-M, similarity
     # >= 50 %) can turn a rename into a delete plus an add, or back, when the file is edited later.
     events_now = parse_name_status(_git(["diff", "--name-status", "-M", f"{base}...{head}"]))
+    meta = {"last_sha": last, "fallback": fallback, "changed": result.changed, "unchanged": result.unchanged,
+            "reverted": result.reverted}
+    # The PR's diff of the changed files as the round at `last` read it ("" without such a round):
+    # number_delta leaves a hunk that removes lines out, or cuts it down, only when it finds it here.
+    reviewed_sections = ""
+    if last and not fallback:
+        reviewed_sections = "".join(text for path, text in split_sections(then) if path in set(result.changed))
+    (out_dir / "interdiff.then.diff").write_text(reviewed_sections, encoding="utf-8")
     if last and not fallback:
         numstat = _git(["diff", "--numstat", last, head, "--", *result.changed]) if result.changed else ""
         paths_then = {path for event in parse_name_status(_git(["diff", "--name-status", "-M", f"{base}...{last}"]))
                       for path in event[1:]}
         events = [event for event in events_now if not set(event[1:]) <= paths_then]
+        # The lines the push itself changed in those files, so that the model reads the push and not
+        # the whole section of every file it touched (number_delta). Only a round that starts from a
+        # reviewed commit has this key.
+        meta["delta"] = (changed_since(_git(["diff", "-U0", last, head, "--", *result.changed]))
+                         if result.changed else {})
     else:
         numstat = _git(["diff", "--numstat", f"{base}...{head}"])
         events = events_now
     (out_dir / "interdiff.numstat").write_text(numstat, encoding="utf-8")
-    (out_dir / "interdiff.json").write_text(json.dumps(
-        {"last_sha": last, "fallback": fallback, "changed": result.changed, "unchanged": result.unchanged,
-         "reverted": result.reverted, "events": [list(event) for event in events],
-         "ignored_changed": ignored_changed}, indent=2), encoding="utf-8")
+    meta.update({"events": [list(event) for event in events], "ignored_changed": ignored_changed})
+    (out_dir / "interdiff.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[claude-review] interdiff: last complete round {last[:12] or '-'}, changed {len(result.changed)}, "
           f"unchanged {len(result.unchanged)}, reverted {len(result.reverted)}, "
           f"added/deleted/renamed {len(events)}")
@@ -1400,7 +1740,8 @@ def _cmd_outcome(args) -> int:
         print(f"error: no run record: {error}", file=sys.stderr)
         _append("GITHUB_STEP_SUMMARY", f"### Claude review run\n\n**No run record:** {error}\n")
         return 1
-    outcome.update({"tier": args.tier, "model": args.model})
+    # The effort the gate decided ("": the model's default), so the efforts can be tuned from the records.
+    outcome.update({"tier": args.tier, "model": args.model, "effort": args.effort})
     # The configured name and, when it differs, what the CLI called: an alias reads "fable (claude-fable-5-2)".
     used = ", ".join(outcome["models_used"])
     model_text = (args.model or "-") + (f" ({used})" if used and used != args.model else "")
@@ -1411,15 +1752,16 @@ def _cmd_outcome(args) -> int:
     else:
         status = "complete" if outcome["subtype"] == "success" else outcome["subtype"]
     print(f"[claude-review] {status}: tier {args.tier or '-'}, model {model_text}, "
-          f"{outcome['num_turns']} turns, {outcome['duration_s']} s")
+          f"effort {args.effort or 'model default'}, {outcome['num_turns']} turns, {outcome['duration_s']} s")
     if status != "complete":
         print(f"::warning::Claude review did not complete ({status}); the review is partial.")
     if outcome["error_text"]:
         # One line, so the workflow command is not cut at the first newline.
         print(f"::error::Claude run error: {' '.join(outcome['error_text'].split())}")
     _append("GITHUB_STEP_SUMMARY",
-            "### Claude review run\n\n| Status | Tier | Model | Turns | Duration (s) |\n|---|---|---|---|---|\n"
-            f"| {status} | {args.tier or '-'} | {model_text} | {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
+            "### Claude review run\n\n| Status | Tier | Model | Effort | Turns | Duration (s) |\n|---|---|---|---|---|---|\n"
+            f"| {status} | {args.tier or '-'} | {model_text} | {args.effort or 'model default'} "
+            f"| {outcome['num_turns']} | {outcome['duration_s']} |\n\n"
             "Source: the `result` record of the Claude Code execution file.\n"
             + (f"\n**Run error:** `{' '.join(outcome['error_text'].split())}`\n" if outcome["error_text"] else ""))
     if args.json_out:
@@ -1460,9 +1802,24 @@ def _cmd_review(args) -> int:
     # Raw diff for `post` (it maps findings onto diff lines); numbered copy for the model.
     diff_path.write_text(diff_text, encoding="utf-8")
     numbered_path = diff_path.with_name(diff_path.name + ".numbered")
-    numbered_path.write_text(number_diff(diff_text), encoding="utf-8")
+    # A further round reads the push: the lines changed since the last reviewed commit, with context.
+    cut_down = args.diff_source == "interdiff" and has_delta(meta)
+    reads = f"model reads {numbered_path.as_posix()}"
+    if cut_down:
+        # The PR's diff of these files at the reviewed commit. Without it no hunk that removes lines
+        # counts as read before, so each one is shown whole.
+        then_path = interdiff_dir / "interdiff.then.diff"
+        then_text = then_path.read_text(encoding="utf-8") if then_path.exists() else ""
+        numbered, cut = _delta_view(diff_text, meta["delta"], then_text)
+        # How much was cut away and how much could not be, so the saving can be read from a run.
+        reads += (f": {len(git_lines(numbered))} lines, {cut['marked']} line(s) changed since the last reviewed "
+                  f"commit, {cut['notes']} note(s), {cut['hunks_left_out']} hunk(s) left out, {cut['whole']} file(s) "
+                  "shown whole")
+    else:
+        numbered = number_diff(diff_text)
+    numbered_path.write_text(numbered, encoding="utf-8")
     print(f"[claude-review] round {args.round} ({args.mode}), diff source {args.diff_source}: "
-          f"{len(git_lines(diff_text))} lines -> {diff_path.as_posix()} (model reads {numbered_path.as_posix()}); "
+          f"{len(git_lines(diff_text))} lines -> {diff_path.as_posix()} ({reads}); "
           f"{len(dropped)} ignored file(s) left out" + (f": {', '.join(dropped[:10])}" if dropped else "")
           + f"; {len(open_findings(state))} open finding(s) of earlier rounds")
     if not diff_text.strip() and not open_findings(state):
@@ -1487,9 +1844,11 @@ def _cmd_review(args) -> int:
         print("::error::ANTHROPIC_API_KEY is not set; the review needs a workspace API key.")
         return 1
     budget, source = tier_budget(tier_cfg, args.tier, os.environ.get(BUDGETS_ENV, ""))
-    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"], budget)
+    # The gate's effort for this run (a check runs at its own); the tier's when the gate adds none.
+    effort = args.effort or tier_cfg.get("effort") or ""
+    command = claude_command(claude_bin, tier_cfg, review_cfg["allowed_tools"], budget, effort)
     print(f"[claude-review] running claude -p: tier {args.tier}, model {tier_cfg['model']}, "
-          f"effort {tier_cfg.get('effort') or 'model default'}, max {tier_cfg['max_turns']} turns, "
+          f"effort {effort or 'model default'}, max {tier_cfg['max_turns']} turns, "
           f"budget from {source}")
     # The model's process gets no budgets: the model reads files, and what it writes is posted publicly.
     child_env = {key: value for key, value in os.environ.items() if key != BUDGETS_ENV}
@@ -1771,6 +2130,8 @@ def main(argv=None) -> int:
                           help="what the model reads (the gate's diff_source output)")
     p_review.add_argument("--mode", default="first", help="the gate's mode output")
     p_review.add_argument("--round", default=1, type=int, help="the gate's round output")
+    p_review.add_argument("--effort", default="", choices=["", *EFFORT_LEVELS],
+                          help="the gate's effort output; empty: the effort of the tier, else the model's default")
     p_review.add_argument("--claude-bin", default="claude")
     p_review.set_defaults(func=_cmd_review)
 
@@ -1796,6 +2157,7 @@ def main(argv=None) -> int:
     p_outcome.add_argument("--execution-file", required=True)
     p_outcome.add_argument("--tier", default="")
     p_outcome.add_argument("--model", default="")
+    p_outcome.add_argument("--effort", default="", help="the gate's effort output; empty: the model's default")
     p_outcome.add_argument("--json", dest="json_out")
     p_outcome.set_defaults(func=_cmd_outcome)
 
